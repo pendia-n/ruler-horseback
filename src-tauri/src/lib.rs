@@ -1,6 +1,7 @@
 mod db;
 mod auth;
 mod todos;
+mod credits;
 
 use tauri::Manager;
 
@@ -17,6 +18,9 @@ pub fn run() {
             todos::add_todo,
             todos::get_todo,
             todos::update_todo,
+            todos::delete_todo,
+            credits::get_credits,
+            credits::get_edit_cost_command,
         ])
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();

@@ -3,6 +3,7 @@ const invoke = window.__TAURI_INTERNALS__.invoke;
 let currentUser = null;
 let countdownInterval = null;
 let pendingTodos = [];
+let userCredits = 0;
 
 // ── UTILS ────────────────────────────────────────────────
 function formatDate(date) {
@@ -40,6 +41,48 @@ function showMsg(el, msg, type = 'error') {
 
 function hideMsg(el) {
     el.className = 'msg';
+}
+
+// ── CREDITS ──────────────────────────────────────────────
+async function fetchCredits() {
+    if (!currentUser) return;
+    try {
+        const info = await invoke('get_credits', { userId: currentUser.id });
+        userCredits = info.credits;
+        updateCreditDisplay();
+        checkBannerConditions(info);
+    } catch (e) {
+        console.error('Failed to fetch credits:', e);
+    }
+}
+
+function updateCreditDisplay() {
+    const el = document.getElementById('credit-balance');
+    if (el) {
+        el.textContent = `${userCredits} units`;
+    }
+}
+
+async function checkBannerConditions(info) {
+    if (!currentUser) return;
+    try {
+        const stats = await invoke('get_credits', { userId: currentUser.id });
+        if (info.weekly_deletions >= 7 && info.credits >= 50) {
+            showBanner();
+        }
+    } catch (e) {
+        console.error('Banner check failed:', e);
+    }
+}
+
+function showBanner() {
+    const banner = document.getElementById('credit-banner');
+    if (banner) {
+        banner.classList.add('show');
+        setTimeout(() => {
+            banner.classList.remove('show');
+        }, 5000);
+    }
 }
 
 // ── RENDER ───────────────────────────────────────────────
@@ -139,8 +182,10 @@ function renderAuth(container) {
 
             if (result.success) {
                 currentUser = { id: result.user_id, username: u };
+                userCredits = 50; // default for new users
                 saveSession();
                 render();
+                fetchCredits();
             } else {
                 showMsg(msgEl, result.message, 'error');
             }
@@ -159,10 +204,21 @@ function renderDashboard(container) {
             <header class="dash-header">
                 <div class="logo">ruler<span>horseback</span></div>
                 <div class="dash-header-actions">
+                    <div class="credit-display">
+                        <span class="credit-icon">&#128176;</span>
+                        <span id="credit-balance">${userCredits} units</span>
+                    </div>
                     <button class="btn btn-secondary btn-sm" id="btn-all">View All Todos</button>
                     <button class="btn btn-ghost btn-sm" id="btn-logout">Logout</button>
                 </div>
             </header>
+            <div class="credit-banner" id="credit-banner">
+                <div class="banner-content">
+                    <span class="banner-icon">&#9888;</span>
+                    <span>You've used your weekly free deletes. Deletions now cost 50 units (5 credits).</span>
+                    <button class="close-btn" id="close-banner">&times;</button>
+                </div>
+            </div>
             <div class="dash-body">
                 <div class="add-form">
                     <h2>Add New Todo</h2>
@@ -224,9 +280,13 @@ function renderDashboard(container) {
     document.getElementById('btn-add-todo').addEventListener('click', handleAddTodo);
     document.getElementById('btn-all').addEventListener('click', openAllTodos);
     document.getElementById('btn-logout').addEventListener('click', handleLogout);
+    document.getElementById('close-banner').addEventListener('click', () => {
+        document.getElementById('credit-banner').classList.remove('show');
+    });
 
     loadUpcoming();
     startCountdown();
+    fetchCredits();
 }
 
 function renderAllTodosModal(todos) {
@@ -251,7 +311,10 @@ function renderAllTodosModal(todos) {
                     <td class="col-title">${escHtml(t.title)}</td>
                     <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
                     <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
-                    <td class="col-action"><button class="btn btn-secondary btn-sm btn-edit-all" data-id="${t.id}">Edit</button></td>
+                    <td class="col-action">
+                        <button class="btn btn-secondary btn-sm btn-edit-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Edit</button>
+                        <button class="btn btn-danger btn-sm btn-delete-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Delete</button>
+                    </td>
                 </tr>`;
         });
     }
@@ -289,11 +352,28 @@ function renderAllTodosModal(todos) {
             openEditModal(parseInt(btn.dataset.id));
         });
     });
+
+    overlay.querySelectorAll('.btn-delete-all').forEach(btn => {
+        btn.addEventListener('click', () => {
+            handleDeleteTodo(parseInt(btn.dataset.id));
+            closeModals();
+        });
+    });
 }
 
 function renderEditModal(todo) {
     const { date: defDate, time: defTime } = formatDeadline(todo.deadline);
     const locked = todo.edit_count >= 1;
+    
+    // Calculate edit cost based on edit_count
+    let editCost = 0;
+    if (todo.edit_count === 0) {
+        editCost = 0;
+    } else if (todo.edit_count >= 1 && todo.edit_count <= 4) {
+        editCost = 4;
+    } else {
+        editCost = 100;
+    }
 
     let overlay = document.getElementById('modal-overlay');
     if (!overlay) {
@@ -308,6 +388,11 @@ function renderEditModal(todo) {
             <div class="modal-header">
                 <h2>Edit Todo #${todo.id}</h2>
                 <button class="close-btn" id="close-edit-modal">&times;</button>
+            </div>
+            <div class="edit-cost-info" ${editCost > 0 ? '' : 'style="display:none"'}>
+                <span class="cost-icon">&#128176;</span>
+                <span>Edit cost: <strong>${editCost} units</strong> (${(editCost / 10).toFixed(1)} credits)</span>
+                <span>Your balance: <strong>${userCredits} units</strong></span>
             </div>
             <div id="edit-msg" class="msg"></div>
             <div class="form-group">
@@ -365,9 +450,11 @@ function renderEditModal(todo) {
                 deadline,
                 editCount: todo.edit_count,
                 currentDeadline: todo.deadline,
+                userId: currentUser.id,
             });
             closeModals();
             loadUpcoming();
+            fetchCredits();
         } catch (e) {
             showMsg(msgEl, e, 'error');
         } finally {
@@ -455,12 +542,17 @@ function renderUpcomingTable(todos) {
             <td class="col-countdown" data-deadline="${t.deadline}">&mdash;</td>
             <td class="col-action">
                 <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
+                <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
             </td>
         </tr>
     `).join('');
 
     tbody.querySelectorAll('.btn-edit').forEach(btn => {
         btn.addEventListener('click', () => openEditModal(parseInt(btn.dataset.id)));
+    });
+
+    tbody.querySelectorAll('.btn-delete').forEach(btn => {
+        btn.addEventListener('click', () => handleDeleteTodo(parseInt(btn.dataset.id)));
     });
 }
 
@@ -513,8 +605,24 @@ async function openEditModal(id) {
 function handleLogout() {
     if (countdownInterval) clearInterval(countdownInterval);
     currentUser = null;
+    userCredits = 0;
     clearSession();
     render();
+}
+
+async function handleDeleteTodo(todoId) {
+    if (!currentUser) return;
+    
+    const confirmed = confirm('Are you sure you want to delete this todo?');
+    if (!confirmed) return;
+
+    try {
+        await invoke('delete_todo', { id: todoId, userId: currentUser.id });
+        loadUpcoming();
+        fetchCredits();
+    } catch (e) {
+        alert('Failed to delete: ' + e);
+    }
 }
 
 // ── SESSION ───────────────────────────────────────────────
@@ -533,7 +641,10 @@ function clearSession() {
 function loadSession() {
     try {
         const s = localStorage.getItem('rh_user');
-        if (s) currentUser = JSON.parse(s);
+        if (s) {
+            currentUser = JSON.parse(s);
+            fetchCredits();
+        }
     } catch (e) {}
 }
 

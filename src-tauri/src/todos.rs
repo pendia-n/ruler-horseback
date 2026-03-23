@@ -1,6 +1,7 @@
 use crate::db::get_conn;
+use crate::credits;
 use mysql::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use chrono::NaiveDateTime;
 
 #[derive(Serialize, Debug)]
@@ -20,24 +21,6 @@ pub struct TodoWithStatus {
     pub status: String,
     pub edit_count: u32,
     pub description: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AddTodoRequest {
-    pub user_id: u32,
-    pub title: String,
-    pub description: String,
-    pub deadline: String,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateTodoRequest {
-    pub id: u32,
-    pub title: String,
-    pub description: String,
-    pub deadline: String,
-    pub edit_count: u32,
-    pub current_deadline: String,
 }
 
 fn parse_datetime(v: mysql::Value) -> String {
@@ -109,15 +92,80 @@ pub fn add_todo(user_id: u32, title: String, description: String, deadline: Stri
 }
 
 #[tauri::command]
-pub fn update_todo(id: u32, title: String, description: String, deadline: String, edit_count: u32, current_deadline: String) -> Result<bool, String> {
+pub fn update_todo(id: u32, title: String, description: String, deadline: String, edit_count: u32, current_deadline: String, user_id: u32) -> Result<bool, String> {
     let mut conn = get_conn()?;
+    
+    // Calculate edit cost
+    let cost = credits::get_edit_cost(edit_count);
+    
+    // Check sufficient credits
+    let user_credits = credits::get_user_credits(user_id)?;
+    if user_credits < cost {
+        return Err(format!("Insufficient credits: {} units available, {} required", user_credits, cost));
+    }
+    
     let increment: u32 = if deadline != current_deadline && edit_count < 1 { 1 } else { 0 };
     if increment == 0 && deadline != current_deadline {
         return Err("Deadline can only be edited once.".to_string());
     }
+    
+    // Deduct credits if cost > 0
+    if cost > 0 {
+        credits::deduct_credits(user_id, cost, "edit", Some(id))?;
+    }
+    
     conn.exec_drop(
         "UPDATE todos SET title = ?, description = ?, deadline = ?, edit_count = edit_count + ? WHERE id = ?",
         (&title, &description, &deadline, &increment, &id),
     ).map_err(|e: mysql::Error| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn delete_todo(id: u32, user_id: u32) -> Result<bool, String> {
+    let mut conn = get_conn()?;
+    
+    // Verify ownership
+    let owner: Option<u32> = conn.exec_first(
+        "SELECT user_id FROM todos WHERE id = ?",
+        (&id,),
+    ).map_err(|e: mysql::Error| e.to_string())?;
+    
+    match owner {
+        Some(owner_id) if owner_id == user_id => {},
+        _ => return Err("Todo not found or access denied".to_string()),
+    }
+    
+    // Get user's created_at for weekly calculation
+    let created_at: Option<String> = conn.exec_first(
+        "SELECT created_at FROM users WHERE user_id = ?",
+        (&user_id,),
+    ).map_err(|e: mysql::Error| e.to_string())?;
+    
+    let created_at_str = created_at.ok_or("User not found".to_string())?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc);
+    
+    // Calculate weekly deletions and cost
+    let weekly_deletions = credits::get_weekly_deletions(user_id, created_at)?;
+    let cost = credits::get_delete_cost(weekly_deletions);
+    
+    // Check sufficient credits
+    let user_credits = credits::get_user_credits(user_id)?;
+    if user_credits < cost {
+        return Err(format!("Insufficient credits: {} units available, {} required", user_credits, cost));
+    }
+    
+    // Deduct credits
+    credits::deduct_credits(user_id, cost, "delete", Some(id))?;
+    credits::update_last_deletion(user_id)?;
+    
+    // Delete the todo
+    conn.exec_drop(
+        "DELETE FROM todos WHERE id = ? AND user_id = ?",
+        (&id, &user_id),
+    ).map_err(|e: mysql::Error| e.to_string())?;
+    
     Ok(true)
 }
