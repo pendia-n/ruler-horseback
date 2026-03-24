@@ -239,6 +239,15 @@ function renderDashboard(container) {
                             </div>
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label>Category</label>
+                        <div class="category-row">
+                            <select id="todo-category">
+                                <option value="">No category</option>
+                            </select>
+                            <button type="button" class="btn btn-secondary btn-sm" id="btn-manage-cats">+</button>
+                        </div>
+                    </div>
                     <div id="add-msg" class="msg"></div>
                     <div class="form-actions">
                         <button class="btn btn-primary" id="btn-add-todo">Add Todo</button>
@@ -246,19 +255,20 @@ function renderDashboard(container) {
                 </div>
 
                 <div class="todo-section">
-                    <div class="todo-section-header">
-                        <h2>Upcoming</h2>
-                        <span class="todo-count" id="upcoming-count">0 / 7</span>
-                    </div>
-                    <table class="todo-table">
-                        <thead>
-                            <tr>
-                                <th class="col-id">#</th>
-                                <th class="col-title">Title</th>
-                                <th class="col-countdown">Countdown</th>
-                                <th class="col-action">Action</th>
-                            </tr>
-                        </thead>
+<div class="todo-section-header">
+    <h2>Upcoming</h2>
+    <span class="todo-count" id="upcoming-count">0 / 7</span>
+</div>
+<table class="todo-table">
+    <thead>
+        <tr>
+            <th class="col-id">#</th>
+            <th class="col-title">Title</th>
+            <th class="col-countdown">Countdown</th>
+            <th class="col-edit-cost">Edit Cost</th>
+            <th class="col-action">Action</th>
+        </tr>
+    </thead>
                         <tbody id="upcoming-tbody">
                         </tbody>
                     </table>
@@ -284,6 +294,19 @@ function renderDashboard(container) {
         document.getElementById('credit-banner').classList.remove('show');
     });
 
+    (async () => {
+        const cats = await loadCategories();
+        const catSelect = document.getElementById('todo-category');
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            catSelect.appendChild(opt);
+        });
+    })();
+
+    document.getElementById('btn-manage-cats')?.addEventListener('click', openCategoryModal);
+
     loadUpcoming();
     startCountdown();
     fetchCredits();
@@ -301,12 +324,16 @@ function renderAllTodosModal(todos) {
     const overdueCount = todos.filter(t => t.status === 'OVERDUE').length;
     let rows = '';
     if (todos.length === 0) {
-        rows = `<tr><td colspan="5"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
+        rows = `<tr><td colspan="6"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
     } else {
         todos.forEach(t => {
             const isOv = t.status === 'OVERDUE';
+            const isCompleted = t.completed;
             rows += `
-                <tr class="${isOv ? 'overdue-row' : ''}">
+                <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
+                    <td class="col-check">
+                        <input type="checkbox" class="todo-check" data-id="${t.id}" ${isCompleted ? 'checked' : ''} ${isOv ? 'disabled' : ''} />
+                    </td>
                     <td class="col-id">#${t.id}</td>
                     <td class="col-title">${escHtml(t.title)}</td>
                     <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
@@ -325,9 +352,22 @@ function renderAllTodosModal(todos) {
                 <h2>All Todos (${todos.length}${overdueCount > 0 ? ', ' + overdueCount + ' overdue' : ''})</h2>
                 <button class="close-btn" id="close-all-modal">&times;</button>
             </div>
+            <div class="modal-filters">
+                <input type="text" id="todo-search" placeholder="Search todos..." />
+                <select id="filter-category">
+                    <option value="">All Categories</option>
+                </select>
+                <select id="filter-status">
+                    <option value="">All Status</option>
+                    <option value="pending">Pending</option>
+                    <option value="completed">Completed</option>
+                    <option value="overdue">Overdue</option>
+                </select>
+            </div>
             <table class="todo-table">
                 <thead>
                     <tr>
+                        <th class="col-check"></th>
                         <th class="col-id">#</th>
                         <th class="col-title">Title</th>
                         <th class="col-countdown">Deadline</th>
@@ -346,19 +386,82 @@ function renderAllTodosModal(todos) {
         if (e.target === overlay) closeModals();
     });
 
-    overlay.querySelectorAll('.btn-edit-all').forEach(btn => {
-        btn.addEventListener('click', () => {
-            closeModals();
-            openEditModal(parseInt(btn.dataset.id));
+    (async () => {
+        const cats = await loadCategories();
+        const filterCat = document.getElementById('filter-category');
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            filterCat.appendChild(opt);
         });
-    });
+    })();
 
-    overlay.querySelectorAll('.btn-delete-all').forEach(btn => {
-        btn.addEventListener('click', () => {
-            handleDeleteTodo(parseInt(btn.dataset.id));
-            closeModals();
+    const searchInput = document.getElementById('todo-search');
+    const filterCat = document.getElementById('filter-category');
+    const filterStatus = document.getElementById('filter-status');
+
+    const applyFilters = () => {
+        const search = searchInput.value.toLowerCase();
+        const cat = filterCat.value;
+        const status = filterStatus.value;
+        
+        const filtered = todos.filter(t => {
+            const matchSearch = t.title.toLowerCase().includes(search) || (t.description && t.description.toLowerCase().includes(search));
+            const matchCat = !cat || t.category_id == cat;
+            let matchStatus = true;
+            if (status === 'pending') matchStatus = !t.completed && t.status !== 'OVERDUE';
+            else if (status === 'completed') matchStatus = t.completed;
+            else if (status === 'overdue') matchStatus = t.status === 'OVERDUE';
+            return matchSearch && matchCat && matchStatus;
         });
-    });
+        
+        const tbody = overlay.querySelector('tbody');
+        if (filtered.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="icon">&#9744;</div><p>No matching todos.</p></div></td></tr>`;
+        } else {
+            tbody.innerHTML = filtered.map(t => {
+                const isOv = t.status === 'OVERDUE';
+                const isCompleted = t.completed;
+                return `
+                    <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
+                        <td class="col-check">
+                            <input type="checkbox" class="todo-check" data-id="${t.id}" ${isCompleted ? 'checked' : ''} ${isOv ? 'disabled' : ''} />
+                        </td>
+                        <td class="col-id">#${t.id}</td>
+                        <td class="col-title">${escHtml(t.title)}</td>
+                        <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
+                        <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
+                        <td class="col-action">
+                            <button class="btn btn-secondary btn-sm btn-edit-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Edit</button>
+                            <button class="btn btn-danger btn-sm btn-delete-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Delete</button>
+                        </td>
+                    </tr>`;
+            }).join('');
+            
+            tbody.querySelectorAll('.btn-edit-all').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    closeModals();
+                    openEditModal(parseInt(btn.dataset.id));
+                });
+            });
+            tbody.querySelectorAll('.btn-delete-all').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    handleDeleteTodo(parseInt(btn.dataset.id));
+                    closeModals();
+                });
+            });
+            tbody.querySelectorAll('.todo-check').forEach(btn => {
+                btn.addEventListener('change', async () => {
+                    await handleToggleCompleted(parseInt(btn.dataset.id));
+                });
+            });
+        }
+    };
+
+    searchInput.addEventListener('input', applyFilters);
+    filterCat.addEventListener('change', applyFilters);
+    filterStatus.addEventListener('change', applyFilters);
 }
 
 function renderEditModal(todo) {
@@ -411,6 +514,12 @@ function renderEditModal(todo) {
                 </div>
                 ${locked ? '<div class="deadline-locked-msg">&#128274; Deadline has already been edited once.</div>' : ''}
             </div>
+            <div class="form-group">
+                <label>Category</label>
+                <select id="edit-category">
+                    <option value="">No category</option>
+                </select>
+            </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" id="cancel-edit">Cancel</button>
                 <button class="btn btn-primary" id="save-edit">Save Changes</button>
@@ -424,6 +533,18 @@ function renderEditModal(todo) {
     overlay.addEventListener('click', (e) => {
         if (e.target === overlay) closeModals();
     });
+
+    (async () => {
+        const cats = await loadCategories();
+        const editCat = document.getElementById('edit-category');
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            if (todo.category_id === c.id) opt.selected = true;
+            editCat.appendChild(opt);
+        });
+    })();
 
     document.getElementById('save-edit').addEventListener('click', async () => {
         const title = document.getElementById('edit-title').value.trim();
@@ -443,6 +564,9 @@ function renderEditModal(todo) {
         saveBtn.innerHTML = '<span class="loading-spinner"></span>';
 
         try {
+            const categorySelect = document.getElementById('edit-category');
+            const categoryId = categorySelect && categorySelect.value ? parseInt(categorySelect.value) : null;
+            
             await invoke('update_todo', {
                 id: todo.id,
                 title,
@@ -451,6 +575,7 @@ function renderEditModal(todo) {
                 editCount: todo.edit_count,
                 currentDeadline: todo.deadline,
                 userId: currentUser.id,
+                categoryId,
             });
             closeModals();
             loadUpcoming();
@@ -470,11 +595,26 @@ function closeModals() {
 }
 
 // ── ACTIONS ──────────────────────────────────────────────
+let categoriesCache = [];
+
+async function loadCategories() {
+    if (!currentUser) return [];
+    try {
+        categoriesCache = await invoke('get_categories', { userId: currentUser.id });
+        return categoriesCache;
+    } catch (e) {
+        console.error('Load categories failed:', e);
+        return [];
+    }
+}
+
 async function handleAddTodo() {
     const title = document.getElementById('todo-title').value.trim();
     const desc = document.getElementById('todo-desc').value.trim();
     const date = document.getElementById('todo-date').value;
     const time = document.getElementById('todo-time').value;
+    const categorySelect = document.getElementById('todo-category');
+    const categoryId = categorySelect && categorySelect.value ? parseInt(categorySelect.value) : null;
     const msgEl = document.getElementById('add-msg');
 
     if (!title || !date || !time) {
@@ -494,6 +634,7 @@ async function handleAddTodo() {
             title,
             description: desc,
             deadline,
+            categoryId,
         });
         document.getElementById('todo-title').value = '';
         document.getElementById('todo-desc').value = '';
@@ -540,6 +681,9 @@ function renderUpcomingTable(todos) {
             <td class="col-id">#${t.id}</td>
             <td class="col-title">${escHtml(t.title)}</td>
             <td class="col-countdown" data-deadline="${t.deadline}">&mdash;</td>
+            <td class="col-edit-cost">
+                ${t.edit_cost > 0 ? `${t.edit_cost} units` : 'Free'}
+            </td>
             <td class="col-action">
                 <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
                 <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
@@ -625,6 +769,16 @@ async function handleDeleteTodo(todoId) {
     }
 }
 
+async function handleToggleCompleted(todoId) {
+    if (!currentUser) return;
+    try {
+        await invoke('toggle_completed', { id: todoId, userId: currentUser.id });
+        loadUpcoming();
+    } catch (e) {
+        alert('Failed to toggle: ' + e);
+    }
+}
+
 // ── SESSION ───────────────────────────────────────────────
 function saveSession() {
     try {
@@ -646,6 +800,125 @@ function loadSession() {
             fetchCredits();
         }
     } catch (e) {}
+}
+
+function openCategoryModal() {
+    let overlay = document.getElementById('modal-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'modal-overlay';
+        document.body.appendChild(overlay);
+    }
+
+    overlay.innerHTML = `
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Manage Categories</h2>
+                <button class="close-btn" id="close-cat-modal">&times;</button>
+            </div>
+            <div class="form-group">
+                <label>New Category</label>
+                <div class="category-input-row">
+                    <input type="text" id="new-cat-name" placeholder="Category name" maxlength="100" />
+                    <input type="color" id="new-cat-color" value="#6366f1" />
+                    <button class="btn btn-primary btn-sm" id="btn-add-cat">Add</button>
+                </div>
+            </div>
+            <div id="cat-msg" class="msg"></div>
+            <div class="category-list" id="category-list"></div>
+        </div>
+    `;
+    overlay.classList.add('active');
+
+    document.getElementById('close-cat-modal').addEventListener('click', closeModals);
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) closeModals();
+    });
+
+    renderCategoryList();
+
+    document.getElementById('btn-add-cat').addEventListener('click', async () => {
+        const name = document.getElementById('new-cat-name').value.trim();
+        const color = document.getElementById('new-cat-color').value;
+        const msgEl = document.getElementById('cat-msg');
+        
+        if (!name) {
+            showMsg(msgEl, 'Category name required', 'error');
+            return;
+        }
+        
+        try {
+            await invoke('create_category', { userId: currentUser.id, name, color });
+            document.getElementById('new-cat-name').value = '';
+            renderCategoryList();
+            refreshCategoryDropdowns();
+        } catch (e) {
+            showMsg(msgEl, e, 'error');
+        }
+    });
+}
+
+async function renderCategoryList() {
+    const list = document.getElementById('category-list');
+    if (!list) return;
+    
+    const cats = await loadCategories();
+    
+    if (cats.length === 0) {
+        list.innerHTML = '<p class="empty-state-text">No categories yet.</p>';
+        return;
+    }
+    
+    list.innerHTML = cats.map(c => `
+        <div class="category-item">
+            <span class="cat-color" style="background:${c.color}"></span>
+            <span class="cat-name">${escHtml(c.name)}</span>
+        </div>
+    `).join('');
+}
+
+async function refreshCategoryDropdowns() {
+    const cats = await loadCategories();
+    
+    const todoCat = document.getElementById('todo-category');
+    if (todoCat) {
+        const selected = todoCat.value;
+        todoCat.innerHTML = '<option value="">No category</option>';
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            todoCat.appendChild(opt);
+        });
+        todoCat.value = selected;
+    }
+    
+    const editCat = document.getElementById('edit-category');
+    if (editCat) {
+        const selected = editCat.value;
+        editCat.innerHTML = '<option value="">No category</option>';
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            editCat.appendChild(opt);
+        });
+        editCat.value = selected;
+    }
+    
+    const filterCat = document.getElementById('filter-category');
+    if (filterCat) {
+        const selected = filterCat.value;
+        filterCat.innerHTML = '<option value="">All Categories</option>';
+        cats.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            filterCat.appendChild(opt);
+        });
+        filterCat.value = selected;
+    }
 }
 
 // ── HELPERS ───────────────────────────────────────────────

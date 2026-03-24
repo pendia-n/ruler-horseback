@@ -19,6 +19,9 @@ pub fn run() {
             todos::get_todo,
             todos::update_todo,
             todos::delete_todo,
+            todos::toggle_completed,
+            todos::get_categories,
+            todos::create_category,
             credits::get_credits,
             credits::get_edit_cost_command,
         ])

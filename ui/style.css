@@ -106,6 +106,85 @@ body {
     outline: none;
 }
 
+.form-group select {
+    width: 100%;
+    padding: 0.6rem 0.85rem;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    outline: none;
+}
+
+.form-group select:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.category-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.category-row select {
+    flex: 1;
+}
+
+.category-input-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.category-input-row input[type="text"] {
+    flex: 1;
+}
+
+.category-input-row input[type="color"] {
+    width: 40px;
+    height: 38px;
+    padding: 2px;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.category-list {
+    margin-top: 1rem;
+}
+
+.category-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.category-item:last-child {
+    border-bottom: none;
+}
+
+.cat-color {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+}
+
+.cat-name {
+    font-size: 0.95rem;
+    color: var(--text);
+}
+
+.empty-state-text {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 1rem;
+}
+
 .form-group input:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-light);
@@ -525,6 +604,18 @@ body {
     background: var(--surface-alt);
 }
 
+.todo-table .col-check {
+    width: 40px;
+    text-align: center;
+}
+
+.todo-table .col-check input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    accent-color: var(--primary);
+}
+
 .todo-table .col-id {
     width: 60px;
     color: var(--text-muted);
@@ -581,6 +672,16 @@ body {
 .todo-table tr.overdue-row .col-countdown,
 .todo-table tr.overdue-row .col-status {
     color: var(--overdue);
+}
+
+.todo-table tr.completed-row td {
+    background: #f0fdf4;
+    opacity: 0.7;
+}
+
+.todo-table tr.completed-row .col-title {
+    text-decoration: line-through;
+    color: var(--text-muted);
 }
 
 /* ── DISABLED BUTTONS (OVERDUE) ─────────────────── */
@@ -678,6 +779,31 @@ body {
     font-size: 1.15rem;
     font-weight: 700;
     color: var(--text);
+}
+
+.modal-filters {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.modal-filters input[type="text"] {
+    flex: 1;
+    min-width: 150px;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+}
+
+.modal-filters select {
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    background: var(--surface);
+    cursor: pointer;
 }
 
 .modal-header .close-btn {
