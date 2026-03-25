@@ -264,6 +264,7 @@ function renderDashboard(container) {
         <tr>
             <th class="col-id">#</th>
             <th class="col-title">Title</th>
+            <th class="col-category">Category</th>
             <th class="col-countdown">Countdown</th>
             <th class="col-edit-cost">Edit Cost</th>
             <th class="col-action">Action</th>
@@ -324,11 +325,15 @@ function renderAllTodosModal(todos) {
     const overdueCount = todos.filter(t => t.status === 'OVERDUE').length;
     let rows = '';
     if (todos.length === 0) {
-        rows = `<tr><td colspan="6"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
+        rows = `<tr><td colspan="7"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
     } else {
         todos.forEach(t => {
             const isOv = t.status === 'OVERDUE';
             const isCompleted = t.completed;
+            const cat = t.category_id ? categoriesCache.find(c => c.id === t.category_id) : null;
+            const catCell = cat
+                ? `<span class="cat-label" style="background:${cat.color}22;color:${cat.color};border:1px solid ${cat.color}44"><span class="cat-dot" style="background:${cat.color}"></span>${escHtml(cat.name)}</span>`
+                : '';
             rows += `
                 <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
                     <td class="col-check">
@@ -336,6 +341,7 @@ function renderAllTodosModal(todos) {
                     </td>
                     <td class="col-id">#${t.id}</td>
                     <td class="col-title">${escHtml(t.title)}</td>
+                    <td class="col-category">${catCell}</td>
                     <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
                     <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
                     <td class="col-action">
@@ -370,6 +376,7 @@ function renderAllTodosModal(todos) {
                         <th class="col-check"></th>
                         <th class="col-id">#</th>
                         <th class="col-title">Title</th>
+                        <th class="col-category">Category</th>
                         <th class="col-countdown">Deadline</th>
                         <th class="col-status">Status</th>
                         <th class="col-action">Action</th>
@@ -418,11 +425,15 @@ function renderAllTodosModal(todos) {
         
         const tbody = overlay.querySelector('tbody');
         if (filtered.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="icon">&#9744;</div><p>No matching todos.</p></div></td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="icon">&#9744;</div><p>No matching todos.</p></div></td></tr>`;
         } else {
             tbody.innerHTML = filtered.map(t => {
                 const isOv = t.status === 'OVERDUE';
                 const isCompleted = t.completed;
+                const cat = t.category_id ? categoriesCache.find(c => c.id === t.category_id) : null;
+                const catCell = cat
+                    ? `<span class="cat-label" style="background:${cat.color}22;color:${cat.color};border:1px solid ${cat.color}44"><span class="cat-dot" style="background:${cat.color}"></span>${escHtml(cat.name)}</span>`
+                    : '';
                 return `
                     <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
                         <td class="col-check">
@@ -430,6 +441,7 @@ function renderAllTodosModal(todos) {
                         </td>
                         <td class="col-id">#${t.id}</td>
                         <td class="col-title">${escHtml(t.title)}</td>
+                        <td class="col-category">${catCell}</td>
                         <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
                         <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
                         <td class="col-action">
@@ -591,7 +603,11 @@ function renderEditModal(todo) {
 
 function closeModals() {
     const overlay = document.getElementById('modal-overlay');
-    if (overlay) overlay.classList.remove('active');
+    if (overlay) {
+        overlay.classList.remove('active');
+        overlay.innerHTML = '';
+    }
+    if (document.activeElement) document.activeElement.blur();
 }
 
 // ── ACTIONS ──────────────────────────────────────────────
@@ -676,10 +692,16 @@ function renderUpcomingTable(todos) {
     }
     empty.style.display = 'none';
 
-    tbody.innerHTML = todos.map(t => `
+    tbody.innerHTML = todos.map(t => {
+        const cat = t.category_id ? categoriesCache.find(c => c.id === t.category_id) : null;
+        const catCell = cat
+            ? `<span class="cat-label" style="background:${cat.color}22;color:${cat.color};border:1px solid ${cat.color}44"><span class="cat-dot" style="background:${cat.color}"></span>${escHtml(cat.name)}</span>`
+            : '';
+        return `
         <tr data-id="${t.id}">
             <td class="col-id">#${t.id}</td>
             <td class="col-title">${escHtml(t.title)}</td>
+            <td class="col-category">${catCell}</td>
             <td class="col-countdown" data-deadline="${t.deadline}">&mdash;</td>
             <td class="col-edit-cost">
                 ${t.edit_cost > 0 ? `${t.edit_cost} units` : 'Free'}
@@ -688,8 +710,8 @@ function renderUpcomingTable(todos) {
                 <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
                 <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
             </td>
-        </tr>
-    `).join('');
+        </tr>`;
+    }).join('');
 
     tbody.querySelectorAll('.btn-edit').forEach(btn => {
         btn.addEventListener('click', () => openEditModal(parseInt(btn.dataset.id)));
@@ -878,39 +900,31 @@ async function renderCategoryList() {
     `).join('');
 }
 
+function buildSelectOptions(selectEl, cats, placeholder) {
+    if (!selectEl) return;
+    const selected = selectEl.value;
+    while (selectEl.options.length > 1) {
+        selectEl.remove(1);
+    }
+    cats.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.name;
+        selectEl.appendChild(opt);
+    });
+    selectEl.value = selected;
+}
+
 async function refreshCategoryDropdowns() {
     const cats = await loadCategories();
-    
-    const todoCat = document.getElementById('todo-category');
-    if (todoCat) {
-        const selected = todoCat.value;
-        todoCat.innerHTML = '<option value="">No category</option>';
-        cats.forEach(c => {
-            const opt = document.createElement('option');
-            opt.value = c.id;
-            opt.textContent = c.name;
-            todoCat.appendChild(opt);
-        });
-        todoCat.value = selected;
-    }
-    
-    const editCat = document.getElementById('edit-category');
-    if (editCat) {
-        const selected = editCat.value;
-        editCat.innerHTML = '<option value="">No category</option>';
-        cats.forEach(c => {
-            const opt = document.createElement('option');
-            opt.value = c.id;
-            opt.textContent = c.name;
-            editCat.appendChild(opt);
-        });
-        editCat.value = selected;
-    }
-    
+    buildSelectOptions(document.getElementById('todo-category'), cats, 'No category');
+    buildSelectOptions(document.getElementById('edit-category'), cats, 'No category');
     const filterCat = document.getElementById('filter-category');
     if (filterCat) {
         const selected = filterCat.value;
-        filterCat.innerHTML = '<option value="">All Categories</option>';
+        while (filterCat.options.length > 1) {
+            filterCat.remove(1);
+        }
         cats.forEach(c => {
             const opt = document.createElement('option');
             opt.value = c.id;

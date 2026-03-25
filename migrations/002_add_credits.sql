@@ -1,5 +1,7 @@
 -- Add credits to users
 ALTER TABLE users ADD COLUMN credits INT DEFAULT 50;
+-- Ensure existing default is 50
+ALTER TABLE users ALTER COLUMN credits SET DEFAULT 50;
 ALTER TABLE users ADD COLUMN last_deletion_at TIMESTAMP NULL;
 
 -- Credit transactions table

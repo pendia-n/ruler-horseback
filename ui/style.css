@@ -141,6 +141,22 @@ body {
 
 .category-input-row input[type="text"] {
     flex: 1;
+    min-width: 120px;
+    padding: 0.6rem 0.85rem;
+    border: 1.5px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    pointer-events: auto !important;
+    opacity: 1 !important;
+}
+
+.category-input-row input[type="text"]:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+    outline: none;
 }
 
 .category-input-row input[type="color"] {
@@ -630,6 +646,29 @@ body {
     white-space: nowrap;
 }
 
+.todo-table .col-category {
+    width: 130px;
+}
+
+.cat-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.cat-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
 .todo-table .col-countdown {
     width: 140px;
     font-variant-numeric: tabular-nums;
@@ -762,6 +801,19 @@ body {
     border: 1px solid var(--border);
     transform: translateY(20px) scale(0.97);
     transition: transform 0.2s;
+    pointer-events: all;
+}
+
+.modal * {
+    pointer-events: auto;
+}
+
+.modal input[type="text"],
+.modal input[type="date"],
+.modal input[type="time"],
+.modal select {
+    pointer-events: auto !important;
+    opacity: 1 !important;
 }
 
 .modal-overlay.active .modal {
@@ -826,6 +878,14 @@ body {
     color: var(--error);
 }
 
+.modal input[type="text"],
+.modal input[type="date"],
+.modal input[type="time"],
+.modal select {
+    pointer-events: auto !important;
+    opacity: 1 !important;
+}
+
 .modal .form-group:last-of-type {
     margin-bottom: 0;
 }
@@ -867,7 +927,7 @@ body {
 
 /* ── ALL TODOS TABLE ──────────────────────────────── */
 .all-todos-modal .modal {
-    max-width: 860px;
+    max-width: 960px;
 }
 
 .all-todos-modal .todo-table {

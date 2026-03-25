@@ -39,7 +39,7 @@ pub fn register_user(username: String, password: String) -> Result<AuthResult, S
     let mut conn = get_conn()?;
     let hashed = hash_password(&password);
     conn.exec_drop(
-        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+        "INSERT INTO users (username, password_hash, credits) VALUES (?, ?, 50)",
         (&username, &hashed),
     ).map_err(|e: mysql::Error| e.to_string())?;
 
