@@ -927,7 +927,8 @@ body {
 
 /* ── ALL TODOS TABLE ──────────────────────────────── */
 .all-todos-modal .modal {
-    max-width: 960px;
+    width: 90vw;
+    max-width: 1200px;
 }
 
 .all-todos-modal .todo-table {
