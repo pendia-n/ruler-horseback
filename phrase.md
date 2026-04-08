@@ -149,3 +149,8 @@ rulerhorseback/
 ---
 *Created: 2026-03-22*
 *Status: Ready for implementation*
+
+## Build & Deployment
+
+Build: npx tauri build
+After every build: rm -rf '/Users/nosensetxt/mvp/rulerhorseback/src-tauri/target/release/deps'
