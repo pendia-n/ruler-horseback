@@ -1,0 +1,14 @@
+name = "rulerhorseback-api"
+main = "worker/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+assets = { directory = "./public", not_found_handling = "single-page-application" }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rulerhorseback-db"
+database_id = "b49455c5-2234-40cf-8186-b71f5db58e40"
+
+[vars]
+APP_URL = "https://rulerhorseback-api.pendia-community.workers.dev"

@@ -1,6 +1,6 @@
 use crate::db::get_conn;
 use crate::credits;
-use mysql::prelude::*;
+use rusqlite::params;
 use serde::Serialize;
 use chrono::NaiveDateTime;
 
@@ -35,51 +35,47 @@ pub struct Category {
     pub color: String,
 }
 
-fn parse_datetime(v: mysql::Value) -> String {
-    match v {
-        mysql::Value::Date(y, m, d, h, mi, s, _) => {
-            format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s)
-        }
-        _ => String::new(),
-    }
-}
-
 #[tauri::command]
-pub fn get_upcoming_todos(user_id: u32) -> Result<Vec<Todo>, String> {
-    let mut conn = get_conn()?;
-    let results: Vec<(u32, String, mysql::Value, Option<String>, u32, i32, Option<u32>)> = conn.exec(
-        "SELECT id, title, deadline, description, edit_count, completed, category_id FROM todos WHERE user_id = ? AND deadline >= NOW() AND completed = 0 ORDER BY deadline ASC LIMIT 7",
-        (&user_id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+pub fn get_upcoming_todos(user_id: String) -> Result<Vec<Todo>, String> {
+    let conn = get_conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, deadline, description, edit_count, completed, category_id \
+         FROM todos WHERE user_id = ?1 AND deadline >= datetime('now') AND completed = 0 \
+         ORDER BY deadline ASC LIMIT 7"
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
 
-    let todos: Vec<Todo> = results.into_iter().map(|(id, title, deadline, description, edit_count, completed, category_id): (u32, String, mysql::Value, Option<String>, u32, i32, Option<u32>)| {
-        Todo { 
-            id, 
-            title, 
-            deadline: parse_datetime(deadline), 
-            description, 
-            edit_count,
-            edit_cost: credits::get_edit_cost(edit_count),
-            completed: completed != 0,
-            category_id
-        }
-    }).collect();
+    let todos: Vec<Todo> = stmt.query_map(params![user_id], |row| {
+        Ok(Todo {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            deadline: row.get(2)?,
+            description: row.get(3)?,
+            edit_count: row.get(4)?,
+            edit_cost: credits::get_edit_cost(row.get::<_, u32>(4)?),
+            completed: row.get::<_, i32>(5)? != 0,
+            category_id: row.get(6)?,
+        })
+    }).map_err(|e: rusqlite::Error| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
     Ok(todos)
 }
 
 #[tauri::command]
-pub fn get_all_todos(user_id: u32) -> Result<Vec<TodoWithStatus>, String> {
-    let mut conn = get_conn()?;
-    let rows: Vec<(u32, String, mysql::Value, Option<String>, u32, i32, Option<u32>)> = conn.exec(
-        "SELECT id, title, deadline, description, edit_count, completed, category_id FROM todos WHERE user_id = ? ORDER BY deadline",
-        (&user_id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+pub fn get_all_todos(user_id: String) -> Result<Vec<TodoWithStatus>, String> {
+    let conn = get_conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, deadline, description, edit_count, completed, category_id \
+         FROM todos WHERE user_id = ?1 ORDER BY deadline"
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
 
     let now = chrono::Local::now().naive_local();
-    let todos: Vec<TodoWithStatus> = rows.into_iter().map(|(id, title, deadline, description, edit_count, completed, category_id): (u32, String, mysql::Value, Option<String>, u32, i32, Option<u32>)| {
-        let deadline_str = parse_datetime(deadline);
+    let todos: Vec<TodoWithStatus> = stmt.query_map(params![user_id], |row| {
+        let deadline_str: String = row.get(2)?;
         let dt = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S").unwrap_or(now);
         let diff = dt.signed_duration_since(now);
+        let completed: i32 = row.get(5)?;
         let status = if completed != 0 {
             "COMPLETED".to_string()
         } else if diff.num_seconds() <= 0 {
@@ -87,161 +83,193 @@ pub fn get_all_todos(user_id: u32) -> Result<Vec<TodoWithStatus>, String> {
         } else {
             format!("{}d {}h {}m", diff.num_days(), diff.num_hours() % 24, diff.num_minutes() % 60)
         };
-        TodoWithStatus { id, title, deadline: deadline_str, description, edit_count, status, completed: completed != 0, category_id }
-    }).collect();
+        Ok(TodoWithStatus {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            deadline: deadline_str,
+            description: row.get(3)?,
+            edit_count: row.get(4)?,
+            status,
+            completed: completed != 0,
+            category_id: row.get(6)?,
+        })
+    }).map_err(|e: rusqlite::Error| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
     Ok(todos)
 }
 
 #[tauri::command]
 pub fn get_todo(id: u32) -> Result<Todo, String> {
-    let mut conn = get_conn()?;
-    let result: Option<(u32, String, mysql::Value, Option<String>, u32, i32, Option<u32>)> = conn.exec_first(
-        "SELECT id, title, deadline, description, edit_count, completed, category_id FROM todos WHERE id = ?",
-        (&id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
-
-    let (tid, title, deadline, description, edit_count, completed, category_id) = result.ok_or("Todo not found".to_string())?;
-    Ok(Todo { 
-        id: tid, 
-        title, 
-        deadline: parse_datetime(deadline), 
-        description, 
-        edit_count,
-        edit_cost: credits::get_edit_cost(edit_count),
-        completed: completed != 0,
-        category_id
-    })
+    let conn = get_conn()?;
+    let result = conn.query_row(
+        "SELECT id, title, deadline, description, edit_count, completed, category_id \
+         FROM todos WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Todo {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                deadline: row.get(2)?,
+                description: row.get(3)?,
+                edit_count: row.get(4)?,
+                edit_cost: credits::get_edit_cost(row.get::<_, u32>(4)?),
+                completed: row.get::<_, i32>(5)? != 0,
+                category_id: row.get(6)?,
+            })
+        },
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
+    Ok(result)
 }
 
 #[tauri::command]
-pub fn add_todo(user_id: u32, title: String, description: String, deadline: String, category_id: Option<u32>) -> Result<bool, String> {
-    let mut conn = get_conn()?;
-    conn.exec_drop(
-        "INSERT INTO todos (user_id, title, description, deadline, edit_count, category_id) VALUES (?, ?, ?, ?, 0, ?)",
-        (&user_id, &title, &description, &deadline, &category_id),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+pub fn add_todo(user_id: String, title: String, description: String, deadline: String, category_id: Option<u32>) -> Result<bool, String> {
+    let conn = get_conn()?;
+    conn.execute(
+        "INSERT INTO todos (user_id, title, description, deadline, edit_count, category_id) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        params![user_id, title, description, deadline, category_id],
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
     Ok(true)
 }
 
 #[tauri::command]
-pub fn update_todo(id: u32, title: String, description: String, deadline: String, edit_count: u32, current_deadline: String, user_id: u32, category_id: Option<u32>) -> Result<bool, String> {
-    let mut conn = get_conn()?;
-    
-    let cost = credits::get_edit_cost(edit_count);
-    
-    let user_credits = credits::get_user_credits(user_id)?;
-    if user_credits < cost {
-        return Err(format!("Insufficient credits: {} units available, {} required", user_credits, cost));
+pub fn update_todo(id: u32, title: String, description: String, deadline: String, user_id: String, category_id: Option<u32>) -> Result<bool, String> {
+    let conn = get_conn()?;
+
+    // Fetch current todo to determine changes
+    let current: (String, String, u32, i32, Option<u32>) = conn.query_row(
+        "SELECT title, deadline, edit_count, completed, category_id FROM todos WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id],
+        |row| Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        )),
+    ).map_err(|e: rusqlite::Error| format!("Todo not found: {}", e))?;
+
+    let (current_title, current_deadline, edit_count, _completed, current_category_id) = current;
+
+    // Check if anything actually changed
+    let title_changed = title != current_title;
+    let deadline_changed = deadline != current_deadline;
+    let category_changed = category_id != current_category_id;
+    let description_changed = description.trim() != conn.query_row(
+        "SELECT description FROM todos WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, Option<String>>(0),
+    ).ok().flatten().unwrap_or_default().trim();
+
+    let anything_changed = title_changed || deadline_changed || description_changed || category_changed;
+
+    if !anything_changed {
+        return Ok(true); // No changes, no cost
     }
-    
-    let increment: u32 = if deadline != current_deadline && edit_count < 1 { 1 } else { 0 };
-    if increment == 0 && deadline != current_deadline {
-        return Err("Deadline can only be edited once.".to_string());
-    }
-    
-    if cost > 0 {
-        credits::deduct_credits(user_id, cost, "edit", Some(id))?;
-    }
-    
-    conn.exec_drop(
-        "UPDATE todos SET title = ?, description = ?, deadline = ?, edit_count = edit_count + ?, category_id = ? WHERE id = ?",
-        (&title, &description, &deadline, &increment, &category_id, &id),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+
+    // Increment edit_count on save
+    let new_edit_count = edit_count + 1;
+
+    conn.execute(
+        "UPDATE todos SET title = ?1, description = ?2, deadline = ?3, edit_count = ?4, \
+         category_id = ?5, updated_at = datetime('now') WHERE id = ?6",
+        params![title, description, deadline, new_edit_count, category_id, id],
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
+
     Ok(true)
 }
 
 #[tauri::command]
-pub fn toggle_completed(id: u32, user_id: u32) -> Result<bool, String> {
-    let mut conn = get_conn()?;
-    
-    let owner: Option<u32> = conn.exec_first(
-        "SELECT user_id FROM todos WHERE id = ?",
-        (&id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
-    
+pub fn toggle_completed(id: u32, user_id: String) -> Result<bool, String> {
+    let conn = get_conn()?;
+
+    let owner: Option<String> = conn.query_row(
+        "SELECT user_id FROM todos WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    ).ok();
+
     match owner {
         Some(owner_id) if owner_id == user_id => {},
         _ => return Err("Todo not found or access denied".to_string()),
     }
-    
-    conn.exec_drop(
-        "UPDATE todos SET completed = NOT completed WHERE id = ?",
-        (&id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+
+    conn.execute(
+        "UPDATE todos SET completed = CASE WHEN completed = 0 THEN 1 ELSE 0 END WHERE id = ?1",
+        params![id],
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
     Ok(true)
 }
 
 #[tauri::command]
-pub fn get_categories(user_id: u32) -> Result<Vec<Category>, String> {
-    let mut conn = get_conn()?;
-    let results: Vec<(u32, String, String)> = conn.exec(
-        "SELECT id, name, color FROM categories WHERE user_id = ? ORDER BY name",
-        (&user_id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+pub fn get_categories(user_id: String) -> Result<Vec<Category>, String> {
+    let conn = get_conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, color FROM categories WHERE user_id = ?1 ORDER BY name"
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
 
-    let categories: Vec<Category> = results.into_iter().map(|(id, name, color)| {
-        Category { id, name, color }
-    }).collect();
+    let categories: Vec<Category> = stmt.query_map(params![user_id], |row| {
+        Ok(Category {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+        })
+    }).map_err(|e: rusqlite::Error| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
     Ok(categories)
 }
 
 #[tauri::command]
-pub fn create_category(user_id: u32, name: String, color: String) -> Result<Category, String> {
-    let mut conn = get_conn()?;
-    conn.exec_drop(
-        "INSERT INTO categories (user_id, name, color) VALUES (?, ?, ?)",
-        (&user_id, &name, &color),
-    ).map_err(|e: mysql::Error| e.to_string())?;
+pub fn create_category(user_id: String, name: String, color: String) -> Result<Category, String> {
+    let conn = get_conn()?;
+    conn.execute(
+        "INSERT INTO categories (user_id, name, color) VALUES (?1, ?2, ?3)",
+        params![user_id, name, color],
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
 
-    let id = conn.last_insert_id() as u32;
+    let id = conn.last_insert_rowid() as u32;
     Ok(Category { id, name, color })
 }
 
 #[tauri::command]
-pub fn delete_todo(id: u32, user_id: u32) -> Result<bool, String> {
-    let mut conn = get_conn()?;
-    
-    // Verify ownership
-    let owner: Option<u32> = conn.exec_first(
-        "SELECT user_id FROM todos WHERE id = ?",
-        (&id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
-    
-    match owner {
-        Some(owner_id) if owner_id == user_id => {},
-        _ => return Err("Todo not found or access denied".to_string()),
+pub fn delete_todo(id: u32, user_id: String) -> Result<bool, String> {
+    let conn = get_conn()?;
+
+    // Verify ownership and check if overdue
+    let todo_info: Option<(String, String, String)> = conn.query_row(
+        "SELECT user_id, deadline, title FROM todos WHERE id = ?1",
+        params![id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).ok();
+
+    let (_owner_id, deadline_str, todo_title) = match todo_info {
+        Some(info) if info.0 == user_id => (info.0, info.1, info.2),
+        Some(_) => return Err("Todo not found or access denied".to_string()),
+        None => return Err("Todo not found".to_string()),
+    };
+
+    // A3: Prevent deleting past/overdue todos
+    let deadline_dt = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S")
+        .map_err(|e| format!("Invalid deadline format: {}", e))?;
+    let now = chrono::Local::now().naive_local();
+    if deadline_dt <= now {
+        return Err("Cannot delete a past/overdue todo".to_string());
     }
-    
-    // Get user's created_at for weekly calculation
-    let created_at: Option<String> = conn.exec_first(
-        "SELECT created_at FROM users WHERE user_id = ?",
-        (&user_id,),
-    ).map_err(|e: mysql::Error| e.to_string())?;
-    
-    let created_at_str = created_at.ok_or("User not found".to_string())?;
-    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| e.to_string())?
-        .with_timezone(&chrono::Utc);
-    
-    // Calculate weekly deletions and cost
-    let weekly_deletions = credits::get_weekly_deletions(user_id, created_at)?;
-    let cost = credits::get_delete_cost(weekly_deletions);
-    
-    // Check sufficient credits
-    let user_credits = credits::get_user_credits(user_id)?;
-    if user_credits < cost {
-        return Err(format!("Insufficient credits: {} units available, {} required", user_credits, cost));
-    }
-    
-    // Deduct credits
-    credits::deduct_credits(user_id, cost, "delete", Some(id))?;
-    credits::update_last_deletion(user_id)?;
-    
+
+    // Log the deletion locally for weekly tracking
+    let weekly = credits::get_weekly_deletions(&user_id)?;
+    let cost = credits::get_delete_cost(weekly);
+    credits::log_deletion(&user_id, cost, &todo_title)?;
+
     // Delete the todo
-    conn.exec_drop(
-        "DELETE FROM todos WHERE id = ? AND user_id = ?",
-        (&id, &user_id),
-    ).map_err(|e: mysql::Error| e.to_string())?;
-    
+    conn.execute(
+        "DELETE FROM todos WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id],
+    ).map_err(|e: rusqlite::Error| e.to_string())?;
+
     Ok(true)
 }

@@ -926,13 +926,30 @@ body {
 }
 
 /* ── ALL TODOS TABLE ──────────────────────────────── */
-.all-todos-modal .modal {
-    width: 90vw;
-    max-width: 1200px;
+.all-todos-modal {
+    width: 90vw !important;
+    max-width: 90vw !important;
+    height: 90vh;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
 }
 
 .all-todos-modal .todo-table {
     margin-top: 1rem;
+}
+
+.all-todos-modal .todo-table tbody {
+    display: block;
+    max-height: calc(90vh - 200px);
+    overflow-y: auto;
+}
+
+.all-todos-modal .todo-table thead,
+.all-todos-modal .todo-table tbody tr {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
 }
 
 /* ── SCROLLBAR ─────────────────────────────────────── */

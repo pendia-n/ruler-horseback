@@ -1,9 +1,16 @@
 const invoke = window.__TAURI_INTERNALS__.invoke;
+const API = 'https://rulerhorseback-api.pendia-community.workers.dev';
+
+// Open URL in system browser via Tauri command
+function openExternal(url) {
+    invoke('open_external', { url }).catch(() => {});
+}
 
 let currentUser = null;
 let countdownInterval = null;
 let pendingTodos = [];
 let userCredits = 0;
+let authToken = null;
 
 // ── UTILS ────────────────────────────────────────────────
 function formatDate(date) {
@@ -39,6 +46,11 @@ function showMsg(el, msg, type = 'error') {
     el.className = `msg msg-${type} show`;
 }
 
+function showMsgHtml(el, html, type = 'error') {
+    el.innerHTML = html;
+    el.className = `msg msg-${type} show`;
+}
+
 function hideMsg(el) {
     el.className = 'msg';
 }
@@ -47,8 +59,19 @@ function hideMsg(el) {
 async function fetchCredits() {
     if (!currentUser) return;
     try {
-        const info = await invoke('get_credits', { userId: currentUser.id });
-        userCredits = info.credits;
+        // Get D1 balance from worker
+        let d1Balance = userCredits;
+        if (authToken) {
+            const res = await fetch(`${API}/api/credits/status`, {
+                headers: { 'Authorization': `Bearer ${authToken}` },
+            });
+            if (res.ok) {
+                const data = await res.json();
+                userCredits = data.credits; // credits from D1, direct
+            }
+        }
+        // Get local stats (weekly deletions, costs)
+        const info = await invoke('get_credit_info', { userId: currentUser.id });
         updateCreditDisplay();
         checkBannerConditions(info);
     } catch (e) {
@@ -59,15 +82,15 @@ async function fetchCredits() {
 function updateCreditDisplay() {
     const el = document.getElementById('credit-balance');
     if (el) {
-        el.textContent = `${userCredits} units`;
+        el.textContent = `${userCredits} credits`;
     }
 }
 
 async function checkBannerConditions(info) {
     if (!currentUser) return;
     try {
-        const stats = await invoke('get_credits', { userId: currentUser.id });
-        if (info.weekly_deletions >= 7 && info.credits >= 50) {
+        const stats = await invoke('get_credit_info', { userId: currentUser.id });
+        if (stats.weekly_deletions >= 7 && userCredits >= 500) {
             showBanner();
         }
     } catch (e) {
@@ -143,16 +166,31 @@ function renderAuth(container) {
                 return;
             }
             try {
-                mode = await invoke('check_username', { username: u });
-                pwGroup.style.display = 'block';
-                submitBtn.style.display = 'flex';
-                submitBtn.disabled = false;
-                submitText.textContent = mode === 'register' ? 'Create Account' : 'Sign In';
-                pwHint.textContent = mode === 'register'
-                    ? 'Min 7 chars, 1 uppercase, 1 digit'
-                    : '';
-                pwInput.value = '';
-                pwInput.focus();
+                // Check username against D1 via worker API
+                const res = await fetch(`${API}/api/auth/check-username?username=${encodeURIComponent(u)}`);
+                const data = await res.json();
+                if (data.available) {
+                    // Account doesn't exist on D1
+                    pwGroup.style.display = 'none';
+                    submitBtn.style.display = 'none';
+                    showMsgHtml(msgEl, 'Account does not exist. <button id="btn-create-account" style="background:none;border:none;color:#60a5fa;text-decoration:underline;cursor:pointer;font:inherit;padding:0;">Create one on the website</button>', 'error');
+                    setTimeout(() => {
+                        const btn = document.getElementById('btn-create-account');
+                        if (btn) btn.addEventListener('click', () => openExternal('https://rulerhorseback-api.pendia-community.workers.dev'));
+                    }, 0);
+                    mode = null;
+                } else {
+                    // Account exists, show password
+                    pwGroup.style.display = 'block';
+                    submitBtn.style.display = 'flex';
+                    submitBtn.disabled = false;
+                    submitText.textContent = 'Sign In';
+                    pwHint.textContent = '';
+                    hideMsg(msgEl);
+                    pwInput.value = '';
+                    pwInput.focus();
+                    mode = 'login';
+                }
             } catch (e) {
                 showMsg(msgEl, 'Connection error: ' + e, 'error');
             }
@@ -174,26 +212,34 @@ function renderAuth(container) {
         try {
             hideMsg(msgEl);
             let result;
-            if (mode === 'register') {
-                result = await invoke('register_user', { username: u, password: p });
+            if (mode === 'login') {
+                const res = await fetch(`${API}/api/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: u, password: p }),
+                });
+                result = await res.json();
+                if (result.success) {
+                    authToken = result.token;
+                }
             } else {
-                result = await invoke('login_user', { username: u, password: p });
+                result = { success: false, message: 'Register is not available in the app.' };
             }
 
             if (result.success) {
-                currentUser = { id: result.user_id, username: u };
-                userCredits = 50; // default for new users
+                currentUser = { id: result.userId, username: u };
+                userCredits = result.credits || 0;
                 saveSession();
                 render();
                 fetchCredits();
             } else {
-                showMsg(msgEl, result.message, 'error');
+                showMsg(msgEl, result.error || 'Login failed', 'error');
             }
         } catch (e) {
             showMsg(msgEl, 'Error: ' + e, 'error');
         } finally {
             submitBtn.disabled = false;
-            submitText.textContent = mode === 'register' ? 'Create Account' : 'Sign In';
+            submitText.textContent = 'Sign In';
         }
     });
 }
@@ -206,16 +252,17 @@ function renderDashboard(container) {
                 <div class="dash-header-actions">
                     <div class="credit-display">
                         <span class="credit-icon">&#128176;</span>
-                        <span id="credit-balance">${userCredits} units</span>
+                        <span id="credit-balance">${userCredits} credits</span>
                     </div>
                     <button class="btn btn-secondary btn-sm" id="btn-all">View All Todos</button>
                     <button class="btn btn-ghost btn-sm" id="btn-logout">Logout</button>
+                    <button class="btn btn-primary btn-sm" id="btn-buy" title="Buy credits on the website">+ Buy Credits</button>
                 </div>
             </header>
             <div class="credit-banner" id="credit-banner">
                 <div class="banner-content">
                     <span class="banner-icon">&#9888;</span>
-                    <span>You've used your weekly free deletes. Deletions now cost 50 units (5 credits).</span>
+                    <span>You've used your weekly free deletes. Deletions now cost 50 credits.</span>
                     <button class="close-btn" id="close-banner">&times;</button>
                 </div>
             </div>
@@ -291,6 +338,9 @@ function renderDashboard(container) {
     document.getElementById('btn-add-todo').addEventListener('click', handleAddTodo);
     document.getElementById('btn-all').addEventListener('click', openAllTodos);
     document.getElementById('btn-logout').addEventListener('click', handleLogout);
+    document.getElementById('btn-buy').addEventListener('click', () => {
+        openExternal('https://rulerhorseback-api.pendia-community.workers.dev');
+    });
     document.getElementById('close-banner').addEventListener('click', () => {
         document.getElementById('credit-banner').classList.remove('show');
     });
@@ -481,14 +531,7 @@ function renderEditModal(todo) {
     const locked = todo.edit_count >= 1;
     
     // Calculate edit cost based on edit_count
-    let editCost = 0;
-    if (todo.edit_count === 0) {
-        editCost = 0;
-    } else if (todo.edit_count >= 1 && todo.edit_count <= 4) {
-        editCost = 4;
-    } else {
-        editCost = 100;
-    }
+    let editCost = todo.edit_cost;
 
     let overlay = document.getElementById('modal-overlay');
     if (!overlay) {
@@ -506,8 +549,8 @@ function renderEditModal(todo) {
             </div>
             <div class="edit-cost-info" ${editCost > 0 ? '' : 'style="display:none"'}>
                 <span class="cost-icon">&#128176;</span>
-                <span>Edit cost: <strong>${editCost} units</strong> (${(editCost / 10).toFixed(1)} credits)</span>
-                <span>Your balance: <strong>${userCredits} units</strong></span>
+                <span>Edit cost: <strong>${editCost} credits</strong></span>
+                <span>Your balance: <strong>${userCredits} credits</strong></span>
             </div>
             <div id="edit-msg" class="msg"></div>
             <div class="form-group">
@@ -579,13 +622,33 @@ function renderEditModal(todo) {
             const categorySelect = document.getElementById('edit-category');
             const categoryId = categorySelect && categorySelect.value ? parseInt(categorySelect.value) : null;
             
+            // Get edit cost from Rust
+            let editCost = 0;
+            if (todo.edit_count >= 1) {
+                editCost = await invoke('get_edit_cost_command', { userId: currentUser.id, todoId: todo.id });
+            }
+            
+            // Deduct credits from D1 via worker (if cost > 0)
+            if (editCost > 0 && authToken) {
+                const res = await fetch(`${API}/api/credits/use`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ amount: editCost }), // cost is in credits directly
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    showMsg(msgEl, err.error || 'Insufficient credits', 'error');
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save Changes';
+                    return;
+                }
+            }
+            
             await invoke('update_todo', {
                 id: todo.id,
                 title,
                 description: desc,
                 deadline,
-                editCount: todo.edit_count,
-                currentDeadline: todo.deadline,
                 userId: currentUser.id,
                 categoryId,
             });
@@ -704,7 +767,7 @@ function renderUpcomingTable(todos) {
             <td class="col-category">${catCell}</td>
             <td class="col-countdown" data-deadline="${t.deadline}">&mdash;</td>
             <td class="col-edit-cost">
-                ${t.edit_cost > 0 ? `${t.edit_cost} units` : 'Free'}
+                ${t.edit_cost > 0 ? `${t.edit_cost} credits` : 'Free'}
             </td>
             <td class="col-action">
                 <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
@@ -778,17 +841,73 @@ function handleLogout() {
 
 async function handleDeleteTodo(todoId) {
     if (!currentUser) return;
-    
-    const confirmed = confirm('Are you sure you want to delete this todo?');
-    if (!confirmed) return;
 
-    try {
-        await invoke('delete_todo', { id: todoId, userId: currentUser.id });
-        loadUpcoming();
-        fetchCredits();
-    } catch (e) {
-        alert('Failed to delete: ' + e);
+    // Show custom confirm modal instead of confirm() which is blocked in Tauri
+    let overlay = document.getElementById('modal-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'modal-overlay';
+        document.body.appendChild(overlay);
     }
+
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:400px;">
+            <div class="modal-header">
+                <h2>Delete Todo</h2>
+                <button class="close-btn" id="close-delete-modal">&times;</button>
+            </div>
+            <p style="margin:1rem 0;color:#94a3b8;">Are you sure you want to delete this todo? This cannot be undone.</p>
+            <div id="delete-msg" class="msg"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="cancel-delete">Cancel</button>
+                <button class="btn btn-danger" id="confirm-delete">Delete</button>
+            </div>
+        </div>
+    `;
+    overlay.classList.add('active');
+
+    document.getElementById('close-delete-modal').addEventListener('click', closeModals);
+    document.getElementById('cancel-delete').addEventListener('click', closeModals);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModals(); });
+
+    document.getElementById('confirm-delete').addEventListener('click', async () => {
+        const msgEl = document.getElementById('delete-msg');
+        const btn = document.getElementById('confirm-delete');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="loading-spinner"></span>';
+
+        try {
+            // Get delete cost from local stats
+            const info = await invoke('get_credit_info', { userId: currentUser.id });
+            const cost = info.delete_cost;
+
+            // Deduct credits from D1 via worker
+            if (cost > 0 && authToken) {
+                const res = await fetch(`${API}/api/credits/use`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ amount: cost }),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    showMsg(msgEl, err.error || 'Insufficient credits', 'error');
+                    btn.disabled = false;
+                    btn.textContent = 'Delete';
+                    return;
+                }
+            }
+
+            await invoke('delete_todo', { id: todoId, userId: currentUser.id });
+            closeModals();
+            loadUpcoming();
+            fetchCredits();
+        } catch (e) {
+            showMsg(msgEl, e.toString(), 'error');
+            btn.disabled = false;
+            btn.textContent = 'Delete';
+        }
+    });
 }
 
 async function handleToggleCompleted(todoId) {
@@ -805,17 +924,20 @@ async function handleToggleCompleted(todoId) {
 function saveSession() {
     try {
         localStorage.setItem('rh_user', JSON.stringify(currentUser));
+        if (authToken) localStorage.setItem('rh_token', authToken);
     } catch (e) {}
 }
 
 function clearSession() {
     try {
         localStorage.removeItem('rh_user');
+        localStorage.removeItem('rh_token');
     } catch (e) {}
 }
 
 function loadSession() {
     try {
+        authToken = localStorage.getItem('rh_token');
         const s = localStorage.getItem('rh_user');
         if (s) {
             currentUser = JSON.parse(s);
@@ -955,14 +1077,8 @@ function escHtml(s) {
             showError('Tauri invoke not found. Is window.__TAURI_INTERNALS__ defined? ' + (typeof window.__TAURI_INTERNALS__ !== 'undefined' ? 'YES' : 'NO'));
             return;
         }
-        invoke('check_username', { username: '__test__' })
-            .then(function(mode) {
-                loadSession();
-                render();
-            })
-            .catch(function(e) {
-                showError('Backend error: ' + (e && e.message ? e.message : String(e)));
-            });
+        loadSession();
+        render();
     } catch (e) {
         console.error('Init error:', e);
         showError('Init error: ' + (e.stack || e.message || String(e)));
