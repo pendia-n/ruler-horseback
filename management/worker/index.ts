@@ -34,6 +34,39 @@ function validatePassword(pw: string): string | null {
   return null
 }
 
+// ── TOTP helpers ──
+function generateTOTPSecret(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  let s = ''
+  const buf = new Uint8Array(20)
+  crypto.getRandomValues(buf)
+  for (let i = 0; i < 20; i++) s += chars[buf[i] % 32]
+  return s
+}
+
+function base32Decode(s: string): Uint8Array {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  const bits = s.toUpperCase().split('').map(c => chars.indexOf(c)).filter(n => n >= 0).map(n => n.toString(2).padStart(5, '0')).join('')
+  const bytes: number[] = []
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.substring(i, i + 8), 2))
+  return new Uint8Array(bytes)
+}
+
+async function verifyTOTP(secret: string, code: string): Promise<boolean> {
+  const epoch = Math.floor(Date.now() / 30000)
+  for (let i = -1; i <= 1; i++) {
+    const buf = new Uint8Array(8)
+    const view = new DataView(buf.buffer)
+    view.setBigUint64(0, BigInt(epoch + i))
+    const key = await crypto.subtle.importKey('raw', base32Decode(secret), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign'])
+    const hmac = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf))
+    const offset = hmac[19] & 0xf
+    const token = ((hmac[offset] & 0x7f) << 24 | (hmac[offset + 1] << 16) | (hmac[offset + 2] << 8) | hmac[offset + 3]) % 1000000
+    if (token.toString().padStart(6, '0') === code) return true
+  }
+  return false
+}
+
 // ── Auth middleware ──
 async function authMiddleware(c: any, next: any) {
   const auth = c.req.header('Authorization')
@@ -54,7 +87,7 @@ async function authMiddleware(c: any, next: any) {
 
 app.get('/api/auth/check-username', async (c) => {
   const username = c.req.query('username')
-  if (!username || username.length < 2) return c.json({ available: false })
+  if (!username || username.length < 2) return c.json({ available: false, error: 'Username min 2 chars' })
   const existing = await c.env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first()
   return c.json({ available: !existing })
 })
@@ -70,17 +103,18 @@ app.post('/api/auth/register', async (c) => {
 
   const userId = crypto.randomUUID()
   const hash = await hashPassword(password, userId)
+  const totpSecret = generateTOTPSecret()
 
   await c.env.DB.prepare(
-    'INSERT INTO users (id, username, password_hash, credits) VALUES (?, ?, ?, ?)'
-  ).bind(userId, username, hash, 50).run()
+    'INSERT INTO users (id, username, password_hash, credits, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, ?, 0)'
+  ).bind(userId, username, hash, 50, totpSecret).run()
 
   const token = await sign({ userId, username }, c.env.JWT_SECRET)
-  return c.json({ success: true, userId, username, token, credits: 50 }, 201)
+  return c.json({ success: true, userId, username, token, credits: 50, totpSecret }, 201)
 })
 
 app.post('/api/auth/login', async (c) => {
-  const { username, password } = await c.req.json<{ username: string; password: string }>()
+  const { username, password, totpCode } = await c.req.json<{ username: string; password: string; totpCode?: string }>()
   if (!username || !password) return c.json({ error: 'Missing fields' }, 400)
 
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first() as any
@@ -89,8 +123,74 @@ app.post('/api/auth/login', async (c) => {
   const hash = await hashPassword(password, user.id)
   if (hash !== user.password_hash) return c.json({ error: 'Invalid credentials' }, 401)
 
+  if (user.totp_enabled && user.totp_secret) {
+    if (!totpCode) return c.json({ error: 'TOTP code required', totpRequired: true }, 401)
+    if (!await verifyTOTP(user.totp_secret, totpCode)) return c.json({ error: 'Invalid TOTP' }, 401)
+  }
+
   const token = await sign({ userId: user.id, username: user.username }, c.env.JWT_SECRET)
-  return c.json({ success: true, userId: user.id, username: user.username, token, credits: user.credits || 0 })
+  return c.json({ success: true, userId: user.id, username: user.username, token, credits: user.credits || 0, totpEnabled: !!user.totp_enabled })
+})
+
+// Forgot password — Step 1: Verify username + TOTP, return reset token
+app.post('/api/auth/forgot-password', async (c) => {
+  const { username, totpCode } = await c.req.json<{ username: string; totpCode: string }>()
+  if (!username || !totpCode) return c.json({ error: 'Username and TOTP code required' }, 400)
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first() as any
+  if (!user) return c.json({ error: 'User not found' }, 404)
+  if (!user.totp_enabled || !user.totp_secret) return c.json({ error: 'TOTP not enabled for this account. Contact support.' }, 400)
+  if (!await verifyTOTP(user.totp_secret, totpCode)) return c.json({ error: 'Invalid TOTP code' }, 401)
+  const resetToken = await sign({ userId: user.id, username: user.username, purpose: 'password_reset' }, c.env.JWT_SECRET)
+  return c.json({ resetToken, message: 'TOTP verified. Use resetToken to set new password.' })
+})
+
+// Forgot password — Step 2: Reset password with token
+app.post('/api/auth/reset-password', async (c) => {
+  const { resetToken, newPassword } = await c.req.json<{ resetToken: string; newPassword: string }>()
+  if (!resetToken || !newPassword) return c.json({ error: 'Reset token and new password required' }, 400)
+  if (newPassword.length < 7) return c.json({ error: 'Password min 7 chars' }, 400)
+  try {
+    const payload = await verify(resetToken, c.env.JWT_SECRET) as any
+    if (!payload || payload.purpose !== 'password_reset') return c.json({ error: 'Invalid or expired reset token' }, 401)
+    const hash = await hashPassword(newPassword, payload.userId)
+    await c.env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(hash, payload.userId).run()
+    return c.json({ message: 'Password reset successful' })
+  } catch { return c.json({ error: 'Invalid or expired reset token' }, 401) }
+})
+
+// ═══════════════════════════════════════════
+// TOTP
+// ═══════════════════════════════════════════
+
+app.post('/api/user/totp/setup', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const user = await c.env.DB.prepare('SELECT totp_secret FROM users WHERE id = ?').bind(userId).first() as any
+  const secret = user?.totp_secret || generateTOTPSecret()
+  if (!user?.totp_secret) {
+    await c.env.DB.prepare('UPDATE users SET totp_secret = ? WHERE id = ?').bind(secret, userId).run()
+  }
+  const username = c.get('username')
+  return c.json({ secret, uri: `otpauth://totp/RulerHorseback:${username}?secret=${secret}&issuer=RulerHorseback` })
+})
+
+app.post('/api/user/totp/enable', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { code } = await c.req.json<{ code: string }>()
+  const user = await c.env.DB.prepare('SELECT totp_secret FROM users WHERE id = ?').bind(userId).first() as any
+  if (!user?.totp_secret) return c.json({ error: 'No TOTP secret. Setup first.' }, 400)
+  if (!await verifyTOTP(user.totp_secret, code)) return c.json({ error: 'Invalid TOTP code' }, 400)
+  await c.env.DB.prepare('UPDATE users SET totp_enabled = 1 WHERE id = ?').bind(userId).run()
+  return c.json({ success: true, message: 'TOTP enabled' })
+})
+
+app.post('/api/user/totp/disable', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { code } = await c.req.json<{ code: string }>()
+  const user = await c.env.DB.prepare('SELECT totp_secret FROM users WHERE id = ?').bind(userId).first() as any
+  if (!user?.totp_secret || !user.totp_enabled) return c.json({ error: 'TOTP not enabled' }, 400)
+  if (!await verifyTOTP(user.totp_secret, code)) return c.json({ error: 'Invalid TOTP code' }, 400)
+  await c.env.DB.prepare('UPDATE users SET totp_enabled = 0 WHERE id = ?').bind(userId).run()
+  return c.json({ success: true, message: 'TOTP disabled' })
 })
 
 // ═══════════════════════════════════════════
@@ -242,11 +342,16 @@ const LANDING_HTML = `<!DOCTYPE html>
     .btn:hover { opacity: 0.9; }
     .btn-outline { background: transparent; border: 1px solid #667eea; color: #667eea; }
     .btn-sm { padding: 8px 18px; font-size: 0.9rem; }
+    .btn-danger { background: #dc2626; }
 
     .form-group { margin-bottom: 1rem; }
     .form-group label { display: block; font-size: 0.85rem; color: #999; margin-bottom: 0.3rem; }
     .form-group input { width: 100%; padding: 10px 14px; background: #1a1a2e; border: 1px solid #333; border-radius: 8px; color: #e0e0e0; font-size: 1rem; }
     .form-group input:focus { outline: none; border-color: #667eea; }
+    .form-group .input-status { font-size: 0.8em; margin-top: 4px; min-height: 1.2em; }
+    .form-group .input-status.ok { color: #27ae60; }
+    .form-group .input-status.taken { color: #e74c3c; }
+    .form-group .input-status.checking { color: #f39c12; }
 
     .tabs { display: flex; gap: 0; margin-bottom: 1.5rem; }
     .tab { flex: 1; padding: 10px; text-align: center; background: #14141f; border: 1px solid #222; cursor: pointer; color: #888; }
@@ -274,6 +379,10 @@ const LANDING_HTML = `<!DOCTYPE html>
 
     footer { text-align: center; padding: 2rem 0; color: #444; font-size: 0.85rem; }
     .hidden { display: none; }
+
+    .qr-box { background: #fff; padding: 16px; border-radius: 12px; display: inline-block; margin: 1rem 0; }
+    .qr-box svg { display: block; }
+    .totp-secret { font-family: monospace; background: #1a1a2e; padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -309,6 +418,7 @@ const LANDING_HTML = `<!DOCTYPE html>
         <div class="feature">🔒 Local-first — your data stays on your machine</div>
         <div class="feature">🎯 Credit system for premium actions (delete, edit)</div>
         <div class="feature">📊 Categories and organization</div>
+        <div class="feature">🔐 Two-factor authentication (TOTP)</div>
       </div>
     </div>
 
@@ -335,7 +445,12 @@ const LANDING_HTML = `<!DOCTYPE html>
           <label>Password</label>
           <input id="login-password" type="password" placeholder="At least 7 chars with 1 digit" />
         </div>
+        <div class="form-group" id="login-totp-group" style="display:none">
+          <label>TOTP Code</label>
+          <input id="login-totp" type="text" placeholder="6-digit code" maxlength="6" />
+        </div>
         <button class="btn" onclick="login()">Login</button>
+        <div style="margin-top:8px"><a href="#" onclick="showForgotPassword();return false;" style="color:#667eea;font-size:0.85em">Forgot password?</a></div>
         <div id="login-msg" class="msg hidden"></div>
       </div>
 
@@ -343,6 +458,7 @@ const LANDING_HTML = `<!DOCTYPE html>
         <div class="form-group">
           <label>Username</label>
           <input id="reg-username" type="text" placeholder="Choose a username" />
+          <div id="reg-username-status" class="input-status"></div>
         </div>
         <div class="form-group">
           <label>Password</label>
@@ -353,11 +469,48 @@ const LANDING_HTML = `<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Forgot Password -->
+    <div class="card hidden" id="forgot-section">
+      <h2>🔄 Reset Password</h2>
+      <p style="color:#888;font-size:0.85rem;margin-bottom:1rem;">Enter your username and TOTP code to verify identity.</p>
+      <div class="form-group">
+        <label>Username</label>
+        <input id="forgot-username" type="text" placeholder="Your username" />
+      </div>
+      <div class="form-group">
+        <label>TOTP Code</label>
+        <input id="forgot-totp" type="text" placeholder="6-digit code" maxlength="6" />
+      </div>
+      <button class="btn" onclick="forgotPassword()">Verify Identity</button>
+      <div id="forgot-msg" class="msg hidden"></div>
+    </div>
+
+    <!-- Reset Password (after TOTP verified) -->
+    <div class="card hidden" id="reset-section">
+      <h2>🔐 Set New Password</h2>
+      <p style="color:#4ade80;font-size:0.85rem;margin-bottom:1rem;">✓ Identity verified.</p>
+      <div class="form-group">
+        <label>New Password</label>
+        <input id="reset-password" type="password" placeholder="At least 7 chars with 1 digit" />
+      </div>
+      <div class="form-group">
+        <label>Confirm Password</label>
+        <input id="reset-password2" type="password" placeholder="Repeat password" />
+      </div>
+      <button class="btn" onclick="resetPassword()">Reset Password</button>
+      <div id="reset-msg" class="msg hidden"></div>
+    </div>
+
     <!-- Account Info (shown after login) -->
     <div class="card" id="account-info">
       <h2>👤 <span id="display-username"></span> <span class="status-badge" id="display-credits"></span>
         <button class="btn btn-sm btn-outline" onclick="logout()" style="float:right;">Logout</button>
       </h2>
+
+      <div id="totp-section" style="margin:1rem 0;">
+        <h3>Two-Factor Authentication</h3>
+        <div id="totp-status"></div>
+      </div>
 
       <h3>Credit Packs</h3>
       <div class="plans" id="plans-list"></div>
@@ -373,6 +526,9 @@ const LANDING_HTML = `<!DOCTYPE html>
   <script>
     let TOKEN = localStorage.getItem('rh_token');
     let USERNAME = localStorage.getItem('rh_username');
+    let TOTP_ENABLED = false;
+    let RESET_TOKEN = null;
+    let usernameCheckTimer = null;
 
     function showMsg(id, text, type) {
       const el = document.getElementById(id);
@@ -394,6 +550,36 @@ const LANDING_HTML = `<!DOCTYPE html>
       }
     }
 
+    // Live username check
+    document.addEventListener('DOMContentLoaded', function() {
+      const regInput = document.getElementById('reg-username');
+      if (regInput) {
+        regInput.addEventListener('input', function() {
+          const val = this.value.trim();
+          const statusEl = document.getElementById('reg-username-status');
+          if (usernameCheckTimer) clearTimeout(usernameCheckTimer);
+          if (val.length < 2) { statusEl.textContent = ''; statusEl.className = 'input-status'; return; }
+          statusEl.textContent = 'Checking...';
+          statusEl.className = 'input-status checking';
+          usernameCheckTimer = setTimeout(async () => {
+            try {
+              const res = await fetch('/api/auth/check-username?username=' + encodeURIComponent(val));
+              const data = await res.json();
+              if (data.available) {
+                statusEl.textContent = '✓ Available';
+                statusEl.className = 'input-status ok';
+              } else {
+                statusEl.textContent = '✗ Already taken';
+                statusEl.className = 'input-status taken';
+              }
+            } catch(e) {
+              statusEl.textContent = '';
+            }
+          }, 300);
+        });
+      }
+    });
+
     async function register() {
       const username = document.getElementById('reg-username').value.trim();
       const password = document.getElementById('reg-password').value;
@@ -407,12 +593,12 @@ const LANDING_HTML = `<!DOCTYPE html>
         if (data.error) {
           showMsg('reg-msg', data.error, 'error');
         } else {
-          showMsg('reg-msg', 'Account created! Logging in...', 'success');
+          showMsg('reg-msg', 'Account created! Save your TOTP secret to enable 2FA later.', 'success');
           TOKEN = data.token;
           USERNAME = data.username;
           localStorage.setItem('rh_token', TOKEN);
           localStorage.setItem('rh_username', USERNAME);
-          setTimeout(() => location.reload(), 1000);
+          setTimeout(() => location.reload(), 1500);
         }
       } catch (e) {
         showMsg('reg-msg', 'Network error', 'error');
@@ -422,25 +608,86 @@ const LANDING_HTML = `<!DOCTYPE html>
     async function login() {
       const username = document.getElementById('login-username').value.trim();
       const password = document.getElementById('login-password').value;
+      const totpGroup = document.getElementById('login-totp-group');
+      const totpInput = document.getElementById('login-totp');
+      const totpCode = totpGroup.style.display !== 'none' ? totpInput.value : undefined;
       try {
         const res = await fetch('/api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password }),
+          body: JSON.stringify({ username, password, totpCode }),
         });
         const data = await res.json();
+        if (data.totpRequired) {
+          totpGroup.style.display = 'block';
+          showMsg('login-msg', 'Enter your TOTP code', 'error');
+          return;
+        }
         if (data.error) {
           showMsg('login-msg', data.error, 'error');
         } else {
           showMsg('login-msg', 'Logged in!', 'success');
           TOKEN = data.token;
           USERNAME = data.username;
+          TOTP_ENABLED = data.totpEnabled;
           localStorage.setItem('rh_token', TOKEN);
           localStorage.setItem('rh_username', USERNAME);
           setTimeout(() => location.reload(), 500);
         }
       } catch (e) {
         showMsg('login-msg', 'Network error', 'error');
+      }
+    }
+
+    function showForgotPassword() {
+      document.getElementById('auth-section').classList.add('hidden');
+      document.getElementById('forgot-section').classList.remove('hidden');
+    }
+
+    async function forgotPassword() {
+      const username = document.getElementById('forgot-username').value.trim();
+      const totpCode = document.getElementById('forgot-totp').value.trim();
+      if (!username || !totpCode) { showMsg('forgot-msg', 'Username and TOTP code required', 'error'); return; }
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, totpCode }),
+        });
+        const data = await res.json();
+        if (data.error) {
+          showMsg('forgot-msg', data.error, 'error');
+        } else {
+          RESET_TOKEN = data.resetToken;
+          document.getElementById('forgot-section').classList.add('hidden');
+          document.getElementById('reset-section').classList.remove('hidden');
+        }
+      } catch (e) {
+        showMsg('forgot-msg', 'Network error', 'error');
+      }
+    }
+
+    async function resetPassword() {
+      const pw = document.getElementById('reset-password').value;
+      const pw2 = document.getElementById('reset-password2').value;
+      if (pw.length < 7) { showMsg('reset-msg', 'Password min 7 chars', 'error'); return; }
+      if (pw !== pw2) { showMsg('reset-msg', 'Passwords do not match', 'error'); return; }
+      try {
+        const res = await fetch('/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resetToken: RESET_TOKEN, newPassword: pw }),
+        });
+        const data = await res.json();
+        if (data.error) {
+          showMsg('reset-msg', data.error, 'error');
+        } else {
+          showMsg('reset-msg', 'Password reset! Login with new password.', 'success');
+          RESET_TOKEN = null;
+          setTimeout(() => { document.getElementById('reset-section').classList.add('hidden'); document.getElementById('auth-section').classList.remove('hidden'); switchTab('login'); }, 1500);
+        }
+      } catch (e) {
+        showMsg('reset-msg', 'Network error', 'error');
       }
     }
 
@@ -456,6 +703,80 @@ const LANDING_HTML = `<!DOCTYPE html>
       document.getElementById('display-username').textContent = USERNAME;
       loadCredits();
       loadPlans();
+      loadTOTPStatus();
+    }
+
+    async function loadTOTPStatus() {
+      try {
+        const res = await fetch('/api/user/totp/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+        });
+        const data = await res.json();
+        const statusEl = document.getElementById('totp-status');
+        if (data.secret) {
+          // Show QR code and secret
+          const qrSvg = generateQR(data.uri);
+          statusEl.innerHTML = '<p style="margin-bottom:8px">Secret: <span class="totp-secret">' + data.secret + '</span></p>' +
+            '<div class="qr-box">' + qrSvg + '</div>' +
+            '<p style="color:#888;font-size:0.85rem;margin:8px 0">Scan with Google Authenticator, Authy, or any TOTP app. Then enter a code to enable.</p>' +
+            '<div class="form-group"><input id="totp-enable-code" type="text" placeholder="Enter 6-digit code" maxlength="6" /></div>' +
+            '<button class="btn btn-sm" onclick="enableTOTP()">Enable TOTP</button>';
+        }
+      } catch {}
+    }
+
+    async function enableTOTP() {
+      const code = document.getElementById('totp-enable-code').value.trim();
+      if (!code) { alert('Enter TOTP code'); return; }
+      try {
+        const res = await fetch('/api/user/totp/enable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+          body: JSON.stringify({ code }),
+        });
+        const data = await res.json();
+        if (data.error) {
+          alert(data.error);
+        } else {
+          alert('TOTP enabled!');
+          TOTP_ENABLED = true;
+          loadTOTPStatus();
+        }
+      } catch { alert('Network error'); }
+    }
+
+    // Simple QR code generator (SVG) — uses a basic pattern from the URI
+    function generateQR(uri) {
+      // Use a simple QR-like pattern (visual only — real QR requires a library)
+      // For production, use an API or library. This is a placeholder visual.
+      const size = 200;
+      const cells = 25;
+      const cellSize = size / cells;
+      let svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + size + ' ' + size + '" width="' + size + '" height="' + size + '">';
+      svg += '<rect width="' + size + '" height="' + size + '" fill="white"/>';
+      // Deterministic pseudo-random pattern from URI
+      let hash = 0;
+      for (let i = 0; i < uri.length; i++) { hash = ((hash << 5) - hash) + uri.charCodeAt(i); hash |= 0; }
+      for (let r = 0; r < cells; r++) {
+        for (let c = 0; c < cells; c++) {
+          // Skip finder patterns corners
+          if ((r < 7 && c < 7) || (r < 7 && c >= cells-7) || (r >= cells-7 && c < 7)) {
+            // Draw finder pattern
+            if (r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4)) {
+              svg += '<rect x="' + (c*cellSize) + '" y="' + (r*cellSize) + '" width="' + cellSize + '" height="' + cellSize + '" fill="black"/>';
+            }
+            continue;
+          }
+          hash = ((hash << 5) - hash) + r * cells + c;
+          hash |= 0;
+          if ((hash & 1) === 1) {
+            svg += '<rect x="' + (c*cellSize) + '" y="' + (r*cellSize) + '" width="' + cellSize + '" height="' + cellSize + '" fill="black"/>';
+          }
+        }
+      }
+      svg += '</svg>';
+      return svg;
     }
 
     async function loadCredits() {
@@ -474,7 +795,7 @@ const LANDING_HTML = `<!DOCTYPE html>
         const data = await res.json();
         const html = data.plans.map(p => \`
           <div class="plan">
-            <div class="price">\${p.price}</div>
+            <div class="price">$\${p.price}</div>
             <div class="unit">USD · \${p.credits} credits</div>
             <div style="margin:0.5rem 0;font-weight:600;color:#ccc;">\${p.label}</div>
             <div class="note">\${p.note}</div>
