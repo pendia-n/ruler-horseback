@@ -528,7 +528,6 @@ function renderAllTodosModal(todos) {
 
 function renderEditModal(todo) {
     const { date: defDate, time: defTime } = formatDeadline(todo.deadline);
-    const locked = todo.edit_count >= 1;
     
     // Calculate edit cost based on edit_count
     let editCost = todo.edit_cost;
@@ -564,10 +563,9 @@ function renderEditModal(todo) {
             <div class="form-group">
                 <label>Deadline *</label>
                 <div class="date-input">
-                    <input type="date" id="edit-date" value="${defDate}" ${locked ? 'disabled' : ''} />
+                    <input type="date" id="edit-date" value="${defDate}" />
                     <input type="time" id="edit-time" value="${defTime}" />
                 </div>
-                ${locked ? '<div class="deadline-locked-msg">&#128274; Deadline has already been edited once.</div>' : ''}
             </div>
             <div class="form-group">
                 <label>Category</label>
