@@ -316,6 +316,7 @@ const LANDING_HTML = `<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RulerHorseback — Native Desktop Todo App</title>
+  <link rel="icon" type="image/png" href="/snakedesk.png" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a12; color: #e0e0e0; }
@@ -841,10 +842,11 @@ const LANDING_HTML = `<!DOCTYPE html>
 
 app.get('/', (c) => c.html(LANDING_HTML))
 
-// Catch-all: API 404, landing page for everything else
+// Catch-all: API 404, landing page for everything else (skip static files)
 app.all('*', async (c) => {
   const url = new URL(c.req.url)
   if (url.pathname.startsWith('/api/')) return c.json({ error: 'Not found' }, 404)
+  if (/\.\w{2,5}$/.test(url.pathname)) return c.notFound()
   return c.html(LANDING_HTML)
 })
 
