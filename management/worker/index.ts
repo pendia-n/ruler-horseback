@@ -266,44 +266,52 @@ app.post('/api/stripe/create-checkout', authMiddleware, async (c) => {
 })
 
 app.post('/api/stripe/webhook', async (c) => {
-  const body = await c.req.text()
-  const sig = c.req.header('stripe-signature')
+  try {
+    const body = await c.req.text()
+    const sig = c.req.header('stripe-signature')
 
-  if (sig && c.env.STRIPE_WEBHOOK_SECRET) {
-    const parts = sig.split(',')
-    let timestamp = ''
-    let sigValue = ''
-    for (const p of parts) {
-      const [k, ...v] = p.split('=')
-      if (k === 't') timestamp = v.join('=')
-      if (k === 'v1') sigValue = v.join('=')
+    if (sig && c.env.STRIPE_WEBHOOK_SECRET) {
+      const parts = sig.split(',')
+      let timestamp = ''
+      let sigValue = ''
+      for (const p of parts) {
+        const [k, ...v] = p.split('=')
+        if (k === 't') timestamp = v.join('=')
+        if (k === 'v1') sigValue = v.join('=')
+      }
+      const signedPayload = `${timestamp}.${body}`
+      const encoder = new TextEncoder()
+      const key = await crypto.subtle.importKey('raw', encoder.encode(c.env.STRIPE_WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+      const expectedSig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload))
+      const expectedHex = hexEncode(expectedSig)
+      if (expectedHex !== sigValue) {
+        console.error('Stripe webhook: invalid signature')
+        return c.json({ error: 'Invalid signature' }, 401)
+      }
     }
-    const signedPayload = `${timestamp}.${body}`
-    const encoder = new TextEncoder()
-    const key = await crypto.subtle.importKey('raw', encoder.encode(c.env.STRIPE_WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
-    const expectedSig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload))
-    const expectedHex = hexEncode(expectedSig)
-    if (expectedHex !== sigValue) return c.json({ error: 'Invalid signature' }, 401)
-  }
 
-  let event: any
-  try { event = JSON.parse(body) } catch { return c.json({ error: 'Invalid payload' }, 400) }
+    let event: any
+    try { event = JSON.parse(body) } catch { return c.json({ error: 'Invalid payload' }, 400) }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object
-    const userId = session.metadata?.user_id
-    const credits = parseInt(session.metadata?.credits || '0')
-    const amount = session.amount_total / 100
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object
+      const userId = session.metadata?.user_id
+      const credits = parseInt(session.metadata?.credits || '0')
+      const amount = session.amount_total / 100
 
-    if (userId && credits > 0) {
-      await c.env.DB.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').bind(credits, userId).run()
-      await c.env.DB.prepare(
-        'INSERT INTO credit_purchases (id, user_id, credits, amount, stripe_session_id) VALUES (?, ?, ?, ?, ?)'
-      ).bind(crypto.randomUUID(), userId, credits, amount, session.id).run()
+      if (userId && credits > 0) {
+        await c.env.DB.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').bind(credits, userId).run()
+        await c.env.DB.prepare(
+          'INSERT INTO credit_purchases (id, user_id, credits, amount, stripe_session_id) VALUES (?, ?, ?, ?, ?)'
+        ).bind(crypto.randomUUID(), userId, credits, amount, session.id).run()
+      }
     }
-  }
 
-  return c.json({ received: true })
+    return c.json({ received: true })
+  } catch (err: any) {
+    console.error('POST /api/stripe/webhook error:', err?.message || err)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
 })
 
 // ═══════════════════════════════════════════
