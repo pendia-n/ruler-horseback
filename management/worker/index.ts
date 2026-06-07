@@ -300,10 +300,14 @@ app.post('/api/stripe/webhook', async (c) => {
       const amount = session.amount_total / 100
 
       if (userId && credits > 0) {
-        await c.env.DB.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').bind(credits, userId).run()
-        await c.env.DB.prepare(
-          'INSERT INTO credit_purchases (id, user_id, credits, amount, stripe_session_id) VALUES (?, ?, ?, ?, ?)'
-        ).bind(crypto.randomUUID(), userId, credits, amount, session.id).run()
+        // Idempotency guard: skip if already processed
+        const existing = await c.env.DB.prepare('SELECT id FROM credit_purchases WHERE stripe_session_id = ?').bind(session.id).first()
+        if (!existing) {
+          await c.env.DB.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').bind(credits, userId).run()
+          await c.env.DB.prepare(
+            'INSERT INTO credit_purchases (id, user_id, credits, amount, stripe_session_id) VALUES (?, ?, ?, ?, ?)'
+          ).bind(crypto.randomUUID(), userId, credits, amount, session.id).run()
+        }
       }
     }
 
