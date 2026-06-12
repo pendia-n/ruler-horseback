@@ -36,6 +36,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Todos
             todos::get_upcoming_todos,
             todos::get_all_todos,
             todos::add_todo,
@@ -43,10 +44,18 @@ pub fn run() {
             todos::update_todo,
             todos::delete_todo,
             todos::toggle_completed,
+            todos::mark_done,
+            todos::mark_lost,
+            todos::detect_due_todos,
+            todos::get_active_count,
+            // Categories
             todos::get_categories,
             todos::create_category,
+            // Credits
             credits::get_credit_info,
             credits::get_edit_cost_command,
+            credits::get_outcome_counts,
+            // Utils
             open_external,
         ])
         .run(tauri::generate_context!())

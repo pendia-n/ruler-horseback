@@ -27,29 +27,30 @@ pub fn get_conn() -> Result<Connection, String> {
 
     let conn = Connection::open(&path).map_err(|e| format!("DB connection failed: {}", e))?;
 
-    // WAL mode for better concurrent access
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .map_err(|e| format!("PRAGMA setup failed: {}", e))?;
 
     Ok(conn)
 }
 
+/// Check if a column exists in a table
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, String> {
+    let sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+    for name in rows {
+        if name.map_err(|e| e.to_string())? == col { return Ok(true); }
+    }
+    Ok(false)
+}
+
 pub fn init_db() -> Result<(), String> {
     let conn = get_conn()?;
 
+    // Create tables if they don't exist (no data loss)
     conn.execute_batch(
         "
-        PRAGMA foreign_keys = OFF;
-
-        -- Drop ALL old tables to eliminate any stale FK constraints from previous versions
-        DROP TABLE IF EXISTS credit_transactions;
-        DROP TABLE IF EXISTS users;
-        DROP TABLE IF EXISTS todos;
-        DROP TABLE IF EXISTS categories;
-        DROP TABLE IF EXISTS delete_log;
-
-        -- No local users table — auth is on D1 via worker API
-
         CREATE TABLE IF NOT EXISTS todos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -79,13 +80,37 @@ pub fn init_db() -> Result<(), String> {
             todo_title TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         );
+        "
+    ).map_err(|e| format!("Schema init failed: {}", e))?;
 
+    // Migrate: add columns that may be missing from older versions
+    // todos.lost
+    if !column_exists(&conn, "todos", "lost")? {
+        conn.execute("ALTER TABLE todos ADD COLUMN lost INTEGER DEFAULT 0", [])
+            .map_err(|e| format!("Migration add lost failed: {}", e))?;
+    }
+    // todos.resolution
+    if !column_exists(&conn, "todos", "resolution")? {
+        conn.execute("ALTER TABLE todos ADD COLUMN resolution TEXT DEFAULT ''", [])
+            .map_err(|e| format!("Migration add resolution failed: {}", e))?;
+    }
+    // todos.due_processed
+    if !column_exists(&conn, "todos", "due_processed")? {
+        conn.execute("ALTER TABLE todos ADD COLUMN due_processed INTEGER DEFAULT 0", [])
+            .map_err(|e| format!("Migration add due_processed failed: {}", e))?;
+    }
+
+    // Create indexes
+    conn.execute_batch(
+        "
         CREATE INDEX IF NOT EXISTS idx_todos_user_deadline ON todos(user_id, deadline);
         CREATE INDEX IF NOT EXISTS idx_todos_completed ON todos(completed);
         CREATE INDEX IF NOT EXISTS idx_todos_category ON todos(category_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_lost ON todos(lost);
+        CREATE INDEX IF NOT EXISTS idx_todos_due_processed ON todos(due_processed);
         CREATE INDEX IF NOT EXISTS idx_delete_log_user_created ON delete_log(user_id, created_at);
         "
-    ).map_err(|e| format!("Schema init failed: {}", e))?;
+    ).map_err(|e| format!("Index init failed: {}", e))?;
 
     Ok(())
 }

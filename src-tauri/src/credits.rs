@@ -12,7 +12,6 @@ pub struct CreditInfo {
 
 pub fn get_weekly_deletions(user_id: &str) -> Result<i32, String> {
     let conn = get_conn()?;
-    // Count deletions in the current week (7-day window from now)
     let week_ago = (Utc::now() - Duration::days(7)).naive_utc().to_string();
     let count: i32 = conn.query_row(
         "SELECT COUNT(*) FROM delete_log WHERE user_id = ?1 AND created_at >= ?2",
@@ -43,6 +42,7 @@ pub fn get_edit_cost(edit_count: u32) -> i32 {
     }
 }
 
+/// Get local done/lost counts for the user (for syncing with D1)
 #[tauri::command]
 pub fn get_credit_info(user_id: String) -> Result<CreditInfo, String> {
     let weekly_deletions = get_weekly_deletions(&user_id)?;
@@ -65,4 +65,23 @@ pub fn get_edit_cost_command(user_id: String, todo_id: u32) -> Result<i32, Strin
     ).map_err(|e: rusqlite::Error| format!("Todo not found: {}", e))?;
 
     Ok(get_edit_cost(edit_count))
+}
+
+/// Get local done/lost counts for the user (for syncing with D1)
+#[tauri::command]
+pub fn get_outcome_counts(user_id: String) -> Result<(i32, i32), String> {
+    let conn = get_conn()?;
+    let done: i32 = conn.query_row(
+        "SELECT COUNT(*) FROM todos WHERE user_id = ?1 AND completed = 1",
+        params![user_id],
+        |row| row.get(0),
+    ).map_err(|e| format!("Failed to count done: {}", e))?;
+
+    let lost: i32 = conn.query_row(
+        "SELECT COUNT(*) FROM todos WHERE user_id = ?1 AND lost = 1",
+        params![user_id],
+        |row| row.get(0),
+    ).map_err(|e| format!("Failed to count lost: {}", e))?;
+
+    Ok((done, lost))
 }

@@ -10,6 +10,16 @@ export interface Env {
   CREDIT_100_PRICE_ID: string
   CREDIT_300_PRICE_ID: string
   CREDIT_1000_PRICE_ID: string
+  OPENROUTER_API_KEY: string
+  APP_URL: string
+}
+
+// JWT tokens expire in 7 days
+const JWT_EXPIRY_SECONDS = 7 * 24 * 60 * 60
+
+async function makeToken(payload: Record<string, any>, secret: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000)
+  return sign({ ...payload, iat: now, exp: now + JWT_EXPIRY_SECONDS }, secret)
 }
 
 const app = new Hono<{ Bindings: Env; Variables: { userId: string; username: string } }>()
@@ -109,7 +119,7 @@ app.post('/api/auth/register', async (c) => {
     'INSERT INTO users (id, username, password_hash, credits, totp_secret, totp_enabled) VALUES (?, ?, ?, ?, ?, 0)'
   ).bind(userId, username, hash, 50, totpSecret).run()
 
-  const token = await sign({ userId, username }, c.env.JWT_SECRET)
+  const token = await makeToken({ userId, username }, c.env.JWT_SECRET)
   return c.json({ success: true, userId, username, token, credits: 50, totpSecret }, 201)
 })
 
@@ -128,7 +138,7 @@ app.post('/api/auth/login', async (c) => {
     if (!await verifyTOTP(user.totp_secret, totpCode)) return c.json({ error: 'Invalid TOTP' }, 401)
   }
 
-  const token = await sign({ userId: user.id, username: user.username }, c.env.JWT_SECRET)
+  const token = await makeToken({ userId: user.id, username: user.username }, c.env.JWT_SECRET)
   return c.json({ success: true, userId: user.id, username: user.username, token, credits: user.credits || 0, totpEnabled: !!user.totp_enabled })
 })
 
@@ -140,7 +150,7 @@ app.post('/api/auth/forgot-password', async (c) => {
   if (!user) return c.json({ error: 'User not found' }, 404)
   if (!user.totp_enabled || !user.totp_secret) return c.json({ error: 'TOTP not enabled for this account. Contact support.' }, 400)
   if (!await verifyTOTP(user.totp_secret, totpCode)) return c.json({ error: 'Invalid TOTP code' }, 401)
-  const resetToken = await sign({ userId: user.id, username: user.username, purpose: 'password_reset' }, c.env.JWT_SECRET)
+  const resetToken = await makeToken({ userId: user.id, username: user.username, purpose: 'password_reset' }, c.env.JWT_SECRET)
   return c.json({ resetToken, message: 'TOTP verified. Use resetToken to set new password.' })
 })
 
@@ -225,8 +235,223 @@ app.get('/api/credits/plans', async (c) => {
 })
 
 // ═══════════════════════════════════════════
-// STRIPE
+// CREDIT STATS (batch apply done/lost/due)
 // ═══════════════════════════════════════════
+
+app.post('/api/credits/apply-stats', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+  const { done_count, lost_count, due_count } = await c.req.json<{
+    done_count: number
+    lost_count: number
+    due_count: number
+  }>().catch(() => ({ done_count: 0, lost_count: 0, due_count: 0 }))
+
+  const done = Math.max(0, done_count || 0)
+  const lost = Math.max(0, lost_count || 0)
+  const due = Math.max(0, due_count || 0)
+
+  // Calculate delta: +5 per 10 done, -10 per 5 lost, -12 per due
+  const rewardFromDone = Math.floor(done / 10) * 5
+  const penaltyFromLost = Math.floor(lost / 5) * 10
+  const penaltyFromDue = due * 12
+  const netDelta = rewardFromDone - penaltyFromLost - penaltyFromDue
+
+  // Get or create user_stats row
+  let stats = await c.env.DB.prepare(
+    'SELECT total_done, total_lost, total_due, net_credit_delta FROM user_stats WHERE user_id = ?'
+  ).bind(userId).first() as any
+
+  if (!stats) {
+    await c.env.DB.prepare(
+      'INSERT INTO user_stats (user_id, total_done, total_lost, total_due, net_credit_delta) VALUES (?, 0, 0, 0, 0)'
+    ).bind(userId).run()
+    stats = { total_done: 0, total_lost: 0, total_due: 0, net_credit_delta: 0 }
+  }
+
+  // Calculate what the new totals should be
+  const newTotalDone = (stats.total_done || 0) + done
+  const newTotalLost = (stats.total_lost || 0) + lost
+  const newTotalDue = (stats.total_due || 0) + due
+
+  // Calculate what the net delta SHOULD be at these totals
+  const expectedNetDelta = Math.floor(newTotalDone / 10) * 5
+    - Math.floor(newTotalLost / 5) * 10
+    - newTotalDue * 12
+
+  // The actual delta to apply is the difference
+  const actualDelta = expectedNetDelta - (stats.net_credit_delta || 0)
+
+  // Apply to user credits
+  // Batch penalties (-10 lost, -12 due) don't apply if balance is already 0
+  // But batch rewards (+5 done) always apply
+  if (actualDelta != 0) {
+    const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
+    const currentCredits = user?.credits || 0
+    let newCredits: number
+    if (actualDelta < 0 && currentCredits === 0) {
+      // Penalty but balance is 0 — don't go negative from batch
+      newCredits = 0
+    } else {
+      newCredits = Math.max(0, currentCredits + actualDelta)
+    }
+    await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
+  }
+
+  // Update stats
+  await c.env.DB.prepare(
+    'INSERT OR REPLACE INTO user_stats (user_id, total_done, total_lost, total_due, net_credit_delta) VALUES (?, ?, ?, ?, ?)'
+  ).bind(userId, newTotalDone, newTotalLost, newTotalDue, expectedNetDelta).run()
+
+  const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
+
+  return c.json({
+    applied: actualDelta,
+    credits: user?.credits || 0,
+    stats: {
+      total_done: newTotalDone,
+      total_lost: newTotalLost,
+      total_due: newTotalDue,
+    },
+    breakdown: {
+      reward_from_done: Math.floor(newTotalDone / 10) * 5,
+      penalty_from_lost: Math.floor(newTotalLost / 5) * 10,
+      penalty_from_due: newTotalDue * 12,
+    }
+  })
+})
+
+
+
+// ═══════════════════════════════════════════
+// AI DESCRIPTION VALIDATION
+// ═══════════════════════════════════════════
+
+const AI_FREE_MODELS = [
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'nvidia/nemotron-3.5-content-safety:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'nvidia/llama-nemotron-embed-vl-1b-v2:free',
+  'qwen/qwen3-coder:free',
+]
+const AI_PAID_FALLBACK = 'inclusionai/ling-2.6-flash'
+const AI_TIMEOUT_MS = 10000
+
+function buildAIPrompt(body: any): string {
+  return `You are a task completion validator. Rate how trustworthy a user's description is on a scale of 0-12.
+
+Todo title: ${body.todoTitle || 'N/A'}
+Todo description: ${body.todoDescription || 'N/A'}
+Created: ${body.createdDate || 'N/A'}
+Completed/Lost on: ${body.endDate || 'N/A'}
+Type: ${body.type || 'done'} ("done" meaning completed, "lost" meaning abandoned/gave up)
+
+User's ${body.type || 'done'} description: ${body.resolutionDescription || ''}
+
+Rate 0-12 considering:
+- Specificity (mentions concrete actions, files, people, tools)
+- Relevance (clearly relates to the todo title/description)
+- Temporal fit (makes sense for the time between created and end date)
+- Effort indicator (shows genuine work or legitimate reason for loss)
+- Avoid generic/vague ("done", "finished it", "idk")
+
+0-3: junk/spam/nonsense
+4-6: vague but not junk
+7-9: acceptable, shows some substance
+10-12: highly specific and trustworthy
+
+Respond ONLY as JSON: {"score": N, "maxScore": 12, "reason": "brief explanation"}`
+}
+
+async function callOpenRouter(apiKey: string, model: string, prompt: string): Promise<any> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 200,
+        temperature: 0.3,
+      }),
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    if (res.status === 429) return { rateLimited: true }
+    if (!res.ok) return { error: true }
+    const data = await res.json() as any
+    const content = data?.choices?.[0]?.message?.content
+    if (!content) return { error: true }
+    const jsonMatch = content.match(/\{[\s\S]*?\}/)
+    if (!jsonMatch) return { error: true }
+    try {
+      return JSON.parse(jsonMatch[0])
+    } catch {
+      return { error: true }
+    }
+  } catch {
+    clearTimeout(timer)
+    return { error: true }
+  }
+}
+
+app.post('/api/ai/validate-description', authMiddleware, async (c) => {
+  const userId = c.get('userId')
+
+  // Rate limit: 1 per 1 minute
+  const recentCount = await c.env.DB.prepare(
+    'SELECT COUNT(*) as cnt FROM ai_validation_log WHERE user_id = ? AND created_at >= datetime(\'now\', \'-1 minute\')'
+  ).bind(userId).first() as any
+  if (recentCount?.cnt >= 1) {
+    return c.json({ error: 'Rate limit: please wait 1 minute between AI validations', retryAfter: 60 }, 429)
+  }
+
+  const body = await c.req.json().catch(() => ({}))
+  const prompt = buildAIPrompt(body)
+
+  // Try free models first, then paid fallback
+  let aiResult: any = null
+  for (const model of [...AI_FREE_MODELS, AI_PAID_FALLBACK]) {
+    aiResult = await callOpenRouter(c.env.OPENROUTER_API_KEY, model, prompt)
+    if (!aiResult?.error && !aiResult?.rateLimited) break
+  }
+
+  if (!aiResult || aiResult.error || aiResult.rateLimited) {
+    return c.json({ error: 'AI service unavailable. Please try again later.' }, 503)
+  }
+
+  const score = Math.max(0, Math.min(12, aiResult.score || 0))
+  const passed = score >= 7
+  const creditChange = passed ? 1 : -1
+
+  // Apply credit change (AI +/-1 always applies, even if balance goes negative)
+  const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
+  const currentCredits = user?.credits || 0
+  const newCredits = currentCredits + creditChange
+  await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
+
+  // Log validation for rate limiting
+  await c.env.DB.prepare(
+    'INSERT INTO ai_validation_log (id, user_id) VALUES (?, ?)'
+  ).bind(crypto.randomUUID(), userId).run()
+
+  return c.json({
+    score,
+    maxScore: 12,
+    passed,
+    reason: aiResult.reason || '',
+    credit_change: creditChange,
+    credits: newCredits,
+  })
+})
+
+
+// ══════════════════════════════════════════</longcat_arg_key>
+
 
 app.post('/api/stripe/create-checkout', authMiddleware, async (c) => {
   const userId = c.get('userId')
@@ -415,8 +640,8 @@ const LANDING_HTML = `<!DOCTYPE html>
 
     <div class="download-section">
       <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
-        <a href="/rulerhorseback.dmg" class="btn">⬇ Download DMG</a>
-        <a href="/rulerhorseback.app.zip" class="btn btn-outline">⬇ Download .app</a>
+        <a href="/rulerhorseback_0.1.0_x64.dmg" class="btn">⬇ Download DMG</a>
+        <a href="/rulerhorseback.app" class="btn btn-outline">⬇ Download .app</a>
       </div>
       <p style="margin-top: 0.8rem; font-size: 0.85rem; color: #666;">
         DMG ~7MB · macOS 12+ · Apple Silicon & Intel
@@ -854,10 +1079,12 @@ const LANDING_HTML = `<!DOCTYPE html>
 
 app.get('/', (c) => c.html(LANDING_HTML))
 
-// Catch-all: API 404, landing page for everything else (skip static files)
+// Catch-all: API 404, landing page for everything else
+// Static files (dmg, zip, png, mp4, etc.) are served by Cloudflare assets handler
 app.all('*', async (c) => {
   const url = new URL(c.req.url)
   if (url.pathname.startsWith('/api/')) return c.json({ error: 'Not found' }, 404)
+  // Return 404 for file requests — Cloudflare will then serve from assets
   if (/\.\w{2,5}$/.test(url.pathname)) return c.notFound()
   return c.html(LANDING_HTML)
 })

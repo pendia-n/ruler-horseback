@@ -250,6 +250,10 @@ function renderDashboard(container) {
             <header class="dash-header">
                 <div class="logo">ruler<span>horseback</span></div>
                 <div class="dash-header-actions">
+                    <div class="active-count" id="active-count" title="Active todos (max 35)">
+                        <span class="active-count-icon">⚡</span>
+                        <span id="active-count-text">0 / 35</span>
+                    </div>
                     <div class="credit-display">
                         <span class="credit-icon">&#128176;</span>
                         <span id="credit-balance">${userCredits} credits</span>
@@ -269,6 +273,7 @@ function renderDashboard(container) {
             <div class="dash-body">
                 <div class="add-form">
                     <h2>Add New Todo</h2>
+                    <div id="cap-warning" class="msg msg-error" style="display:none;"></div>
                     <div class="form-group">
                         <label>Title *</label>
                         <input type="text" id="todo-title" placeholder="What needs to be done?" maxlength="255" />
@@ -304,7 +309,7 @@ function renderDashboard(container) {
                 <div class="todo-section">
 <div class="todo-section-header">
     <h2>Upcoming</h2>
-    <span class="todo-count" id="upcoming-count">0 / 7</span>
+    <span class="todo-count" id="upcoming-count">0 / 35</span>
 </div>
 <table class="todo-table">
     <thead>
@@ -361,6 +366,271 @@ function renderDashboard(container) {
     loadUpcoming();
     startCountdown();
     fetchCredits();
+    loadActiveCount();
+    // Detect due todos on load and apply penalties
+    applyDuePenalties();
+}
+
+// ── Active count ──────────────────────────────────────────
+
+async function loadActiveCount() {
+    if (!currentUser) return;
+    try {
+        const info = await invoke('get_active_count', { userId: currentUser.id });
+        const el = document.getElementById('active-count-text');
+        if (el) el.textContent = `${info.active} / ${info.max_active}`;
+        // Update upcoming count too
+        const uc = document.getElementById('upcoming-count');
+        if (uc) uc.textContent = `${info.active} / ${info.max_active}`;
+        // Warning if at cap
+        const warning = document.getElementById('cap-warning');
+        const addBtn = document.getElementById('btn-add-todo');
+        if (info.active >= info.max_active) {
+            if (warning) {
+                warning.textContent = `Active todo cap reached (${info.max_active}). Complete, lose, or let some expire before adding more.`;
+                warning.style.display = 'block';
+                warning.className = 'msg msg-error show';
+            }
+            if (addBtn) addBtn.disabled = true;
+        } else {
+            if (warning) warning.style.display = 'none';
+            if (addBtn) addBtn.disabled = false;
+        }
+    } catch (e) {
+        console.error('Load active count failed:', e);
+    }
+}
+
+// ── Due detection ─────────────────────────────────────────
+
+async function applyDuePenalties() {
+    if (!currentUser || !authToken) return;
+    try {
+        const result = await invoke('detect_due_todos', { userId: currentUser.id });
+        if (result.due_count > 0) {
+            // Apply to worker
+            await fetch(`${API}/api/credits/apply-stats`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                body: JSON.stringify({ done_count: 0, lost_count: 0, due_count: result.due_count }),
+            });
+            fetchCredits();
+        }
+    } catch (e) {
+        console.error('Due detection failed:', e);
+    }
+}
+
+// ── Mark Done / Mark Lost modals ──────────────────────────
+
+async function openMarkDoneModal(id) {
+    const todo = await invoke('get_todo', { id, userId: currentUser.id }).catch(() => null);
+    if (!todo) return;
+
+    let overlay = document.getElementById('modal-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'modal-overlay';
+        document.body.appendChild(overlay);
+    }
+
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:480px;">
+            <div class="modal-header">
+                <h2>✓ Mark as Done</h2>
+                <button class="close-btn" id="close-done-modal">&times;</button>
+            </div>
+            <p style="color:#94a3b8;font-size:0.85rem;margin-bottom:1rem;">
+                <strong>${escHtml(todo.title)}</strong><br/>
+                Deadline: ${escHtml(todo.deadline.slice(0, 16))}
+            </p>
+            <div id="done-resolution-field">
+                <div class="form-group">
+                    <label>How was this completed? *</label>
+                    <textarea id="done-desc-input" rows="3" placeholder="Describe what you did — be specific. What was the outcome? Which files/tasks were involved?">${escHtml(todo.resolution || '')}</textarea>
+                    <p class="hint" id="done-desc-hint">Min 12 chars, 3+ words. Specific descriptions get better credit scores.</p>
+                </div>
+            </div>
+            <div id="done-msg" class="msg"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="cancel-done">Cancel</button>
+                <button class="btn btn-primary" id="confirm-done">Mark Done</button>
+            </div>
+        </div>
+    `;
+    overlay.classList.add('active');
+
+    document.getElementById('close-done-modal').addEventListener('click', closeModals);
+    document.getElementById('cancel-done').addEventListener('click', closeModals);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModals(); });
+
+    document.getElementById('confirm-done').addEventListener('click', async () => {
+        const desc = document.getElementById('done-desc-input').value.trim();
+        const msgEl = document.getElementById('done-msg');
+        const btn = document.getElementById('confirm-done');
+
+        if (!desc) {
+            showMsg(msgEl, 'Please describe how this was completed.', 'error');
+            return;
+        }
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="loading-spinner"></span>';
+
+        try {
+            // Step 1: Rust backend validates description (junk filter)
+            await invoke('mark_done', { id, userId: currentUser.id, resolution: desc });
+
+            // Step 2: AI validation (rate limit: 1/min, +/-1 credit)
+            if (authToken) {
+                try {
+                    const aiRes = await fetch(`${API}/api/ai/validate-description`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                        body: JSON.stringify({
+                            todoTitle: todo.title,
+                            todoDescription: todo.description || '',
+                            createdDate: todo.created_at || '',
+                            endDate: new Date().toISOString(),
+                            type: 'done',
+                            resolutionDescription: desc,
+                        }),
+                    });
+                    if (aiRes.ok) {
+                        const aiData = await aiRes.json();
+                        // Show AI feedback briefly
+                        const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
+                        const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
+                        showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
+                    }
+                    // If AI fails (rate limit, service down), continue anyway — not blocking
+                } catch (aiErr) {
+                    console.error('AI validation failed:', aiErr);
+                }
+
+                // Step 3: Batch credit sync (+5 per 10 done, etc.)
+                await fetch(`${API}/api/credits/apply-stats`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ done_count: 1, lost_count: 0, due_count: 0 }),
+                });
+            }
+
+            closeModals();
+            loadUpcoming();
+            fetchCredits();
+            loadActiveCount();
+        } catch (e) {
+            showMsg(msgEl, e.toString(), 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Mark Done';
+        }
+    });
+}
+
+async function openMarkLostModal(id) {
+    const todo = await invoke('get_todo', { id, userId: currentUser.id }).catch(() => null);
+    if (!todo) return;
+
+    let overlay = document.getElementById('modal-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'modal-overlay';
+        document.body.appendChild(overlay);
+    }
+
+    overlay.innerHTML = `
+        <div class="modal" style="max-width:480px;">
+            <div class="modal-header">
+                <h2>✗ Mark as Lost</h2>
+                <button class="close-btn" id="close-lost-modal">&times;</button>
+            </div>
+            <p style="color:#94a3b8;font-size:0.85rem;margin-bottom:1rem;">
+                <strong>${escHtml(todo.title)}</strong><br/>
+                Deadline: ${escHtml(todo.deadline.slice(0, 16))}
+            </p>
+            <div class="form-group">
+                <label>Why was this lost? *</label>
+                <textarea id="lost-desc-input" rows="3" placeholder="Explain why this todo was abandoned — be specific. What blocked it? Why is it no longer needed?"></textarea>
+                <p class="hint">Min 12 chars, 3+ words. Helps track patterns.</p>
+            </div>
+            <div id="lost-msg" class="msg"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="cancel-lost">Cancel</button>
+                <button class="btn btn-danger" id="confirm-lost">Mark Lost</button>
+            </div>
+        </div>
+    `;
+    overlay.classList.add('active');
+
+    document.getElementById('close-lost-modal').addEventListener('click', closeModals);
+    document.getElementById('cancel-lost').addEventListener('click', closeModals);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModals(); });
+
+    document.getElementById('confirm-lost').addEventListener('click', async () => {
+        const desc = document.getElementById('lost-desc-input').value.trim();
+        const msgEl = document.getElementById('lost-msg');
+        const btn = document.getElementById('confirm-lost');
+
+        if (!desc) {
+            showMsg(msgEl, 'Please explain why this was lost.', 'error');
+            return;
+        }
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="loading-spinner"></span>';
+
+        try {
+            // Step 1: Rust backend validates description (junk filter)
+            await invoke('mark_lost', { id, userId: currentUser.id, reason: desc });
+
+            // Step 2: AI validation (rate limit: 1/min, +/-1 credit)
+            if (authToken) {
+                try {
+                    const aiRes = await fetch(`${API}/api/ai/validate-description`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                        body: JSON.stringify({
+                            todoTitle: todo.title,
+                            todoDescription: todo.description || '',
+                            createdDate: todo.created_at || '',
+                            endDate: new Date().toISOString(),
+                            type: 'lost',
+                            resolutionDescription: desc,
+                        }),
+                    });
+                    if (aiRes.ok) {
+                        const aiData = await aiRes.json();
+                        const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
+                        const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
+                        showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
+                    }
+                } catch (aiErr) {
+                    console.error('AI validation failed:', aiErr);
+                }
+
+                // Step 3: Batch credit sync (-10 per 5 lost, etc.)
+                await fetch(`${API}/api/credits/apply-stats`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ done_count: 0, lost_count: 1, due_count: 0 }),
+                });
+            }
+
+            closeModals();
+            loadUpcoming();
+            fetchCredits();
+            loadActiveCount();
+        } catch (e) {
+            showMsg(msgEl, e.toString(), 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Mark Lost';
+        }
+    });
 }
 
 function renderAllTodosModal(todos) {
@@ -372,31 +642,38 @@ function renderAllTodosModal(todos) {
         document.body.appendChild(overlay);
     }
 
-    const overdueCount = todos.filter(t => t.status === 'OVERDUE').length;
+    const doneCount = todos.filter(t => t.completed).length;
+    const lostCount = todos.filter(t => t.lost).length;
+    const dueCount = todos.filter(t => t.status === 'DUE').length;
     let rows = '';
     if (todos.length === 0) {
-        rows = `<tr><td colspan="7"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
+        rows = `<tr><td colspan="8"><div class="empty-state"><div class="icon">&#9744;</div><p>No todos yet.</p></div></td></tr>`;
     } else {
         todos.forEach(t => {
-            const isOv = t.status === 'OVERDUE';
+            const isDue = t.status === 'DUE';
             const isCompleted = t.completed;
+            const isLost = t.lost;
+            const isTerminal = isCompleted || isLost || isDue;
             const cat = t.category_id ? categoriesCache.find(c => c.id === t.category_id) : null;
             const catCell = cat
                 ? `<span class="cat-label" style="background:${cat.color}22;color:${cat.color};border:1px solid ${cat.color}44"><span class="cat-dot" style="background:${cat.color}"></span>${escHtml(cat.name)}</span>`
                 : '';
+            const statusClass = isCompleted ? 'status-done' : isLost ? 'status-lost' : isDue ? 'status-due' : 'status-pending';
+            const resolutionHtml = t.resolution ? `<div class="resolution-text" style="font-size:0.75rem;color:#64748b;margin-top:4px;" title="${escHtml(t.resolution)}">${escHtml(t.resolution.slice(0, 60))}${t.resolution.length > 60 ? '...' : ''}</div>` : '';
             rows += `
-                <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
-                    <td class="col-check">
-                        <input type="checkbox" class="todo-check" data-id="${t.id}" ${isCompleted ? 'checked' : ''} ${isOv ? 'disabled' : ''} />
-                    </td>
+                <tr class="${isDue ? 'due-row' : ''} ${isCompleted ? 'completed-row' : ''} ${isLost ? 'lost-row' : ''}">
                     <td class="col-id">#${t.id}</td>
-                    <td class="col-title">${escHtml(t.title)}</td>
+                    <td class="col-title">${escHtml(t.title)}${resolutionHtml}</td>
                     <td class="col-category">${catCell}</td>
                     <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
-                    <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
+                    <td class="col-status ${statusClass}">${escHtml(t.status)}</td>
                     <td class="col-action">
-                        <button class="btn btn-secondary btn-sm btn-edit-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Edit</button>
-                        <button class="btn btn-danger btn-sm btn-delete-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Delete</button>
+                        ${!isTerminal ? `
+                            <button class="btn btn-success btn-sm btn-done-all" data-id="${t.id}" title="Mark as done">&#10003;</button>
+                            <button class="btn btn-warning btn-sm btn-lost-all" data-id="${t.id}" title="Mark as lost">&#10007;</button>
+                            <button class="btn btn-secondary btn-sm btn-edit-all" data-id="${t.id}">Edit</button>
+                            <button class="btn btn-danger btn-sm btn-delete-all" data-id="${t.id}">Delete</button>
+                        ` : '<span style="color:#64748b;font-size:0.8rem;">—</span>'}
                     </td>
                 </tr>`;
         });
@@ -405,7 +682,7 @@ function renderAllTodosModal(todos) {
     overlay.innerHTML = `
         <div class="modal all-todos-modal">
             <div class="modal-header">
-                <h2>All Todos (${todos.length}${overdueCount > 0 ? ', ' + overdueCount + ' overdue' : ''})</h2>
+                <h2>All Todos (${todos.length}${doneCount > 0 ? ', ' + doneCount + ' done' : ''}${lostCount > 0 ? ', ' + lostCount + ' lost' : ''}${dueCount > 0 ? ', ' + dueCount + ' due' : ''})</h2>
                 <button class="close-btn" id="close-all-modal">&times;</button>
             </div>
             <div class="modal-filters">
@@ -416,8 +693,9 @@ function renderAllTodosModal(todos) {
                 <select id="filter-status">
                     <option value="">All Status</option>
                     <option value="pending">Pending</option>
-                    <option value="completed">Completed</option>
-                    <option value="overdue">Overdue</option>
+                    <option value="done">Done</option>
+                    <option value="lost">Lost</option>
+                    <option value="due">Due</option>
                 </select>
             </div>
             <table class="todo-table">
@@ -467,9 +745,10 @@ function renderAllTodosModal(todos) {
             const matchSearch = t.title.toLowerCase().includes(search) || (t.description && t.description.toLowerCase().includes(search));
             const matchCat = !cat || t.category_id == cat;
             let matchStatus = true;
-            if (status === 'pending') matchStatus = !t.completed && t.status !== 'OVERDUE';
-            else if (status === 'completed') matchStatus = t.completed;
-            else if (status === 'overdue') matchStatus = t.status === 'OVERDUE';
+            if (status === 'pending') matchStatus = !t.completed && !t.lost && t.status !== 'DUE';
+            else if (status === 'done') matchStatus = t.completed;
+            else if (status === 'lost') matchStatus = t.lost;
+            else if (status === 'due') matchStatus = t.status === 'DUE';
             return matchSearch && matchCat && matchStatus;
         });
         
@@ -478,29 +757,46 @@ function renderAllTodosModal(todos) {
             tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="icon">&#9744;</div><p>No matching todos.</p></div></td></tr>`;
         } else {
             tbody.innerHTML = filtered.map(t => {
-                const isOv = t.status === 'OVERDUE';
+                const isDue = t.status === 'DUE';
                 const isCompleted = t.completed;
+                const isLost = t.lost;
+                const isTerminal = isCompleted || isLost || isDue;
                 const cat = t.category_id ? categoriesCache.find(c => c.id === t.category_id) : null;
                 const catCell = cat
                     ? `<span class="cat-label" style="background:${cat.color}22;color:${cat.color};border:1px solid ${cat.color}44"><span class="cat-dot" style="background:${cat.color}"></span>${escHtml(cat.name)}</span>`
                     : '';
+                const statusClass = isCompleted ? 'status-done' : isLost ? 'status-lost' : isDue ? 'status-due' : 'status-pending';
+                const resolutionHtml = t.resolution ? `<div class="resolution-text" style="font-size:0.75rem;color:#64748b;margin-top:4px;" title="${escHtml(t.resolution)}">${escHtml(t.resolution.slice(0, 60))}${t.resolution.length > 60 ? '...' : ''}</div>` : '';
                 return `
-                    <tr class="${isOv ? 'overdue-row' : ''} ${isCompleted ? 'completed-row' : ''}">
-                        <td class="col-check">
-                            <input type="checkbox" class="todo-check" data-id="${t.id}" ${isCompleted ? 'checked' : ''} ${isOv ? 'disabled' : ''} />
-                        </td>
+                    <tr class="${isDue ? 'due-row' : ''} ${isCompleted ? 'completed-row' : ''} ${isLost ? 'lost-row' : ''}">
                         <td class="col-id">#${t.id}</td>
-                        <td class="col-title">${escHtml(t.title)}</td>
+                        <td class="col-title">${escHtml(t.title)}${resolutionHtml}</td>
                         <td class="col-category">${catCell}</td>
                         <td class="col-countdown">${escHtml(t.deadline.slice(0, 16))}</td>
-                        <td class="col-status ${isOv ? 'overdue' : 'pending'}">${escHtml(t.status)}</td>
+                        <td class="col-status ${statusClass}">${escHtml(t.status)}</td>
                         <td class="col-action">
-                            <button class="btn btn-secondary btn-sm btn-edit-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Edit</button>
-                            <button class="btn btn-danger btn-sm btn-delete-all ${isOv ? 'btn-disabled' : ''}" data-id="${t.id}" ${isOv ? 'disabled' : ''}>Delete</button>
+                            ${!isTerminal ? `
+                                <button class="btn btn-success btn-sm btn-done-all" data-id="${t.id}" title="Mark as done">&#10003;</button>
+                                <button class="btn btn-warning btn-sm btn-lost-all" data-id="${t.id}" title="Mark as lost">&#10007;</button>
+                                <button class="btn btn-secondary btn-sm btn-edit-all" data-id="${t.id}">Edit</button>
+                                <button class="btn btn-danger btn-sm btn-delete-all" data-id="${t.id}">Delete</button>
+                            ` : '<span style="color:#64748b;font-size:0.8rem;">—</span>'}
                         </td>
                     </tr>`;
             }).join('');
             
+            tbody.querySelectorAll('.btn-done-all').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    closeModals();
+                    openMarkDoneModal(parseInt(btn.dataset.id));
+                });
+            });
+            tbody.querySelectorAll('.btn-lost-all').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    closeModals();
+                    openMarkLostModal(parseInt(btn.dataset.id));
+                });
+            });
             tbody.querySelectorAll('.btn-edit-all').forEach(btn => {
                 btn.addEventListener('click', () => {
                     closeModals();
@@ -511,11 +807,6 @@ function renderAllTodosModal(todos) {
                 btn.addEventListener('click', () => {
                     handleDeleteTodo(parseInt(btn.dataset.id));
                     closeModals();
-                });
-            });
-            tbody.querySelectorAll('.todo-check').forEach(btn => {
-                btn.addEventListener('change', async () => {
-                    await handleToggleCompleted(parseInt(btn.dataset.id));
                 });
             });
         }
@@ -718,6 +1009,7 @@ async function handleAddTodo() {
         document.getElementById('todo-time').value = '12:00';
         hideMsg(msgEl);
         loadUpcoming();
+        loadActiveCount();
     } catch (e) {
         showMsg(msgEl, 'Error: ' + e, 'error');
     } finally {
@@ -744,7 +1036,10 @@ function renderUpcomingTable(todos) {
 
     if (!tbody) return;
 
-    count.textContent = `${todos.length} / 7`;
+    // Get max active from the active-count display
+    const activeCountEl = document.getElementById('active-count-text');
+    const maxActive = activeCountEl ? activeCountEl.textContent.split('/')[1].trim() : 35;
+    count.textContent = `${todos.length} / ${maxActive}`;
 
     if (todos.length === 0) {
         tbody.innerHTML = '';
@@ -768,16 +1063,23 @@ function renderUpcomingTable(todos) {
                 ${t.edit_cost > 0 ? `${t.edit_cost} credits` : 'Free'}
             </td>
             <td class="col-action">
+                <button class="btn btn-success btn-sm btn-done" data-id="${t.id}" title="Mark as done">&#10003;</button>
+                <button class="btn btn-warning btn-sm btn-lost" data-id="${t.id}" title="Mark as lost">&#10007;</button>
                 <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
                 <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
             </td>
         </tr>`;
     }).join('');
 
+    tbody.querySelectorAll('.btn-done').forEach(btn => {
+        btn.addEventListener('click', () => openMarkDoneModal(parseInt(btn.dataset.id)));
+    });
+    tbody.querySelectorAll('.btn-lost').forEach(btn => {
+        btn.addEventListener('click', () => openMarkLostModal(parseInt(btn.dataset.id)));
+    });
     tbody.querySelectorAll('.btn-edit').forEach(btn => {
         btn.addEventListener('click', () => openEditModal(parseInt(btn.dataset.id)));
     });
-
     tbody.querySelectorAll('.btn-delete').forEach(btn => {
         btn.addEventListener('click', () => handleDeleteTodo(parseInt(btn.dataset.id)));
     });
