@@ -14,8 +14,8 @@ export interface Env {
   APP_URL: string
 }
 
-// JWT tokens expire in 7 days
-const JWT_EXPIRY_SECONDS = 7 * 24 * 60 * 60
+// JWT tokens expire in 5 days
+const JWT_EXPIRY_SECONDS = 5 * 24 * 60 * 60
 
 async function makeToken(payload: Record<string, any>, secret: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
@@ -318,13 +318,15 @@ Respond ONLY as JSON: {"score": N, "maxScore": 12, "reason": "brief explanation"
 
 async function callOpenRouter(apiKey: string, model: string, prompt: string): Promise<any> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(), 25000)
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://rulerhorseback-api.pendia-community.workers.dev',
+        'X-Title': 'RulerHorseback',
       },
       body: JSON.stringify({
         model,
@@ -334,34 +336,38 @@ async function callOpenRouter(apiKey: string, model: string, prompt: string): Pr
       }),
       signal: controller.signal,
     })
-    clearTimeout(timer)
+    clearTimeout(timeout)
     if (res.status === 429) return { rateLimited: true }
-    if (!res.ok) return { error: true }
+    if (!res.ok) return { error: `http_${res.status}` }
     const data = await res.json() as any
     const content = data?.choices?.[0]?.message?.content
-    if (!content) return { error: true }
+    if (!content) return { error: 'no_content' }
     const jsonMatch = content.match(/\{[\s\S]*?\}/)
-    if (!jsonMatch) return { error: true }
+    if (!jsonMatch) return { error: 'no_json_match' }
     try {
       return JSON.parse(jsonMatch[0])
     } catch {
-      return { error: true }
+      return { error: 'json_parse_fail' }
     }
   } catch {
-    clearTimeout(timer)
-    return { error: true }
+    clearTimeout(timeout)
+    return { error: 'fetch_failed' }
   }
 }
 
 app.post('/api/ai/validate-description', authMiddleware, async (c) => {
   const userId = c.get('userId')
 
-  // Rate limit: 1 per 1 minute
-  const recentCount = await c.env.DB.prepare(
-    'SELECT COUNT(*) as cnt FROM ai_validation_log WHERE user_id = ? AND created_at >= datetime(\'now\', \'-1 minute\')'
-  ).bind(userId).first() as any
-  if (recentCount?.cnt >= 1) {
-    return c.json({ error: 'Rate limit: please wait 1 minute between AI validations', retryAfter: 60 }, 429)
+  // Rate limit: 1 per 1 minute (skip check if table doesn't exist)
+  try {
+    const recentCount = await c.env.DB.prepare(
+      'SELECT COUNT(*) as cnt FROM ai_validation_log WHERE user_id = ? AND created_at >= datetime(\'now\', \'-1 minute\')'
+    ).bind(userId).first() as any
+    if (recentCount?.cnt >= 1) {
+      return c.json({ error: 'Rate limit: please wait 1 minute between AI validations', retryAfter: 60 }, 429)
+    }
+  } catch (rateErr: any) {
+    console.error('Rate limit check failed (table may not exist):', rateErr?.message)
   }
 
   const body = await c.req.json().catch(() => ({}))
@@ -375,7 +381,7 @@ app.post('/api/ai/validate-description', authMiddleware, async (c) => {
   }
 
   if (!aiResult || aiResult.error || aiResult.rateLimited) {
-    return c.json({ error: 'AI service unavailable. Please try again later.' }, 503)
+    return c.json({ error: aiResult?.error || 'AI service unavailable', detail: aiResult?.detail || aiResult?.raw || '' }, 503)
   }
 
   const score = Math.max(0, Math.min(12, aiResult.score || 0))
@@ -389,9 +395,13 @@ app.post('/api/ai/validate-description', authMiddleware, async (c) => {
   await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
 
   // Log validation for rate limiting
-  await c.env.DB.prepare(
-    'INSERT INTO ai_validation_log (id, user_id) VALUES (?, ?)'
-  ).bind(crypto.randomUUID(), userId).run()
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO ai_validation_log (id, user_id) VALUES (?, ?)'
+    ).bind(crypto.randomUUID(), userId).run()
+  } catch {
+    // Table might not exist — non-critical
+  }
 
   return c.json({
     score,
