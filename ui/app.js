@@ -1069,10 +1069,12 @@ function renderUpcomingTable(todos) {
                 ${t.edit_cost > 0 ? `${t.edit_cost} credits` : 'Free'}
             </td>
             <td class="col-action">
-                <button class="btn btn-success btn-sm btn-done" data-id="${t.id}" title="Mark as done">&#10003;</button>
-                <button class="btn btn-warning btn-sm btn-lost" data-id="${t.id}" title="Mark as lost">&#10007;</button>
-                <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
-                <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
+                ${!t.completed && !t.lost ? `
+                    <button class="btn btn-success btn-sm btn-done" data-id="${t.id}" title="Mark as done">&#10003;</button>
+                    <button class="btn btn-warning btn-sm btn-lost" data-id="${t.id}" title="Mark as lost">&#10007;</button>
+                    <button class="btn btn-secondary btn-sm btn-edit" data-id="${t.id}">Edit</button>
+                    <button class="btn btn-danger btn-sm btn-delete" data-id="${t.id}" title="Delete todo">Delete</button>
+                ` : '<span style="color:#64748b;font-size:0.8rem;">—</span>'}
             </td>
         </tr>`;
     }).join('');
@@ -1096,27 +1098,22 @@ function updateCountdowns() {
     if (!tbody) return;
 
     const rows = tbody.querySelectorAll('tr');
-    let anyOverdue = false;
-
     rows.forEach(row => {
         const cell = row.querySelector('.col-countdown');
+        if (!cell) return;
         const deadline = cell.dataset.deadline;
+        if (!deadline) return;
         const label = countdownLabel(deadline);
-        if (!label) {
-            anyOverdue = true;
-        } else {
-            cell.textContent = label;
-        }
+        cell.textContent = label || '—';
     });
-
-    if (anyOverdue) {
-        setTimeout(loadUpcoming, 1000);
-    }
 }
 
 function startCountdown() {
     if (countdownInterval) clearInterval(countdownInterval);
-    countdownInterval = setInterval(updateCountdowns, 3000);
+    countdownInterval = setInterval(() => {
+        updateCountdowns();
+        applyDuePenalties();
+    }, 5000);
 }
 
 async function openAllTodos() {

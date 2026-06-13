@@ -174,33 +174,60 @@ pub fn get_active_count(user_id: String) -> Result<ActiveCount, String> {
 #[tauri::command]
 pub fn get_upcoming_todos(user_id: String) -> Result<Vec<Todo>, String> {
     let conn = get_conn()?;
+    // Get all non-completed, non-lost todos (including past-due), filter in Rust
     let mut stmt = conn.prepare(
         "SELECT id, title, deadline, description, edit_count, completed, lost, category_id, resolution
-         FROM todos 
+         FROM todos
          WHERE user_id = ?1
-           AND deadline >= datetime('now')
            AND completed = 0
            AND lost = 0
-           AND due_processed = 0
-         ORDER BY deadline ASC LIMIT 35"
+         ORDER BY deadline ASC LIMIT 50"
     ).map_err(|e: rusqlite::Error| e.to_string())?;
 
-    let todos: Vec<Todo> = stmt.query_map(params![user_id], |row| {
-        Ok(Todo {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            deadline: row.get(2)?,
-            description: row.get(3)?,
-            edit_count: row.get(4)?,
-            edit_cost: credits::get_edit_cost(row.get::<_, u32>(4)?),
-            completed: row.get::<_, i32>(5)? != 0,
-            lost: row.get::<_, i32>(6)? != 0,
-            category_id: row.get(7)?,
-            resolution: row.get(8)?,
+    let now = chrono::Local::now().naive_local();
+    let todos: Vec<Todo> = stmt
+        .query_map(params![user_id], |row| {
+            let deadline_str: String = row.get(2)?;
+            let dt = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S").unwrap_or(now);
+            // Only include if deadline is in the future (not due)
+            if dt <= now {
+                // Return a dummy that will be filtered out
+                Ok(Todo {
+                    id: 0,
+                    title: String::new(),
+                    deadline: String::new(),
+                    description: None,
+                    edit_count: 0,
+                    edit_cost: 0,
+                    completed: false,
+                    lost: false,
+                    category_id: None,
+                    resolution: None,
+                })
+            } else {
+                Ok(Todo {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    deadline: deadline_str,
+                    description: row.get(3)?,
+                    edit_count: row.get(4)?,
+                    edit_cost: credits::get_edit_cost(row.get::<_, u32>(4)?),
+                    completed: row.get::<_, i32>(5)? != 0,
+                    lost: row.get::<_, i32>(6)? != 0,
+                    category_id: row.get(7)?,
+                    resolution: row.get(8)?,
+                })
+            }
         })
-    }).map_err(|e: rusqlite::Error| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
+        .map_err(|e: rusqlite::Error| e.to_string())?
+        .filter_map(|r| {
+            match r {
+                Ok(todo) if todo.id != 0 => Some(todo),
+                _ => None,
+            }
+        })
+        .take(35)
+        .collect();
 
     Ok(todos)
 }
