@@ -137,10 +137,11 @@ pub fn validate_resolution(description: &str) -> Result<(), String> {
 pub fn count_active_todos(user_id: &str) -> Result<i32, String> {
     let conn = get_conn()?;
     let count: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM todos 
-         WHERE user_id = ?1 
-           AND completed = 0 
-           AND lost = 0 
+        "SELECT COUNT(*) FROM todos
+         WHERE user_id = ?1
+           AND completed = 0
+           AND lost = 0
+           AND due_processed = 0
            AND deadline > datetime('now')",
         params![user_id],
         |row| row.get(0),
@@ -176,10 +177,11 @@ pub fn get_upcoming_todos(user_id: String) -> Result<Vec<Todo>, String> {
     let mut stmt = conn.prepare(
         "SELECT id, title, deadline, description, edit_count, completed, lost, category_id, resolution
          FROM todos 
-         WHERE user_id = ?1 
-           AND deadline >= datetime('now') 
-           AND completed = 0 
+         WHERE user_id = ?1
+           AND deadline >= datetime('now')
+           AND completed = 0
            AND lost = 0
+           AND due_processed = 0
          ORDER BY deadline ASC LIMIT 35"
     ).map_err(|e: rusqlite::Error| e.to_string())?;
 
@@ -249,12 +251,12 @@ pub fn get_all_todos(user_id: String) -> Result<Vec<TodoWithStatus>, String> {
 }
 
 #[tauri::command]
-pub fn get_todo(id: u32, user_id: String) -> Result<Todo, String> {
+pub fn get_todo(id: u32) -> Result<Todo, String> {
     let conn = get_conn()?;
     let result = conn.query_row(
         "SELECT id, title, deadline, description, edit_count, completed, lost, category_id, resolution
-         FROM todos WHERE id = ?1 AND user_id = ?2",
-        params![id, user_id],
+         FROM todos WHERE id = ?1",
+        params![id],
         |row| {
             Ok(Todo {
                 id: row.get(0)?,

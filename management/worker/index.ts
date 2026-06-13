@@ -281,19 +281,11 @@ app.post('/api/credits/apply-stats', authMiddleware, async (c) => {
   // The actual delta to apply is the difference
   const actualDelta = expectedNetDelta - (stats.net_credit_delta || 0)
 
-  // Apply to user credits
-  // Batch penalties (-10 lost, -12 due) don't apply if balance is already 0
-  // But batch rewards (+5 done) always apply
+  // Apply to user credits — always apply the full delta (can go negative for penalties)
   if (actualDelta != 0) {
     const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
     const currentCredits = user?.credits || 0
-    let newCredits: number
-    if (actualDelta < 0 && currentCredits === 0) {
-      // Penalty but balance is 0 — don't go negative from batch
-      newCredits = 0
-    } else {
-      newCredits = Math.max(0, currentCredits + actualDelta)
-    }
+    const newCredits = currentCredits + actualDelta
     await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
   }
 

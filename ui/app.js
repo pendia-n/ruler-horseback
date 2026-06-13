@@ -404,17 +404,22 @@ async function loadActiveCount() {
 // ── Due detection ─────────────────────────────────────────
 
 async function applyDuePenalties() {
-    if (!currentUser || !authToken) return;
+    if (!currentUser) return;
     try {
         const result = await invoke('detect_due_todos', { userId: currentUser.id });
         if (result.due_count > 0) {
-            // Apply to worker
-            await fetch(`${API}/api/credits/apply-stats`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-                body: JSON.stringify({ done_count: 0, lost_count: 0, due_count: result.due_count }),
-            });
-            fetchCredits();
+            // Apply to worker (always deduct, even if balance goes negative)
+            if (authToken) {
+                await fetch(`${API}/api/credits/apply-stats`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ done_count: 0, lost_count: 0, due_count: result.due_count }),
+                });
+                fetchCredits();
+            }
+            // Refresh the dashboard to remove due todos from active list
+            loadUpcoming();
+            loadActiveCount();
         }
     } catch (e) {
         console.error('Due detection failed:', e);
@@ -943,6 +948,7 @@ function renderEditModal(todo) {
             });
             closeModals();
             loadUpcoming();
+            loadActiveCount();
             fetchCredits();
         } catch (e) {
             showMsg(msgEl, e, 'error');
@@ -1201,6 +1207,7 @@ async function handleDeleteTodo(todoId) {
             await invoke('delete_todo', { id: todoId, userId: currentUser.id });
             closeModals();
             loadUpcoming();
+            loadActiveCount();
             fetchCredits();
         } catch (e) {
             showMsg(msgEl, e.toString(), 'error');
@@ -1215,6 +1222,7 @@ async function handleToggleCompleted(todoId) {
     try {
         await invoke('toggle_completed', { id: todoId, userId: currentUser.id });
         loadUpcoming();
+        loadActiveCount();
     } catch (e) {
         alert('Failed to toggle: ' + e);
     }
