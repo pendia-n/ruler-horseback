@@ -408,22 +408,48 @@ async function applyDuePenalties() {
     try {
         const result = await invoke('detect_due_todos', { userId: currentUser.id });
         if (result.due_count > 0) {
-            // Apply to worker (always deduct, even if balance goes negative)
+            const penalty = result.due_count * 12;
+            // Deduct credits from worker if logged in
             if (authToken) {
-                await fetch(`${API}/api/credits/apply-stats`, {
+                const res = await fetch(`${API}/api/credits/apply-stats`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
                     body: JSON.stringify({ done_count: 0, lost_count: 0, due_count: result.due_count }),
                 });
+                if (!res.ok) {
+                    console.error('Worker apply-stats failed:', res.status, await res.text());
+                }
                 fetchCredits();
             }
-            // Refresh the dashboard to remove due todos from active list
+            // Always show feedback
+            console.log(`Due detection: ${result.due_count} todo(s), -${penalty} credits`);
+            // Update header balance display immediately
+            userCredits = Math.max(0, userCredits - penalty);
+            updateCreditDisplay();
+            // Reload table to remove due todos
             loadUpcoming();
             loadActiveCount();
         }
     } catch (e) {
         console.error('Due detection failed:', e);
     }
+}
+
+function startCountdown() {
+    if (countdownInterval) clearInterval(countdownInterval);
+    // Update countdown text every 1.5s — no table re-render
+    countdownInterval = setInterval(() => {
+        updateCountdowns();
+    }, 1500);
+    // Check for due todos and refresh dashboard every 5s
+    setInterval(() => {
+        applyDuePenalties();
+        // Always refresh to catch any changes
+        if (currentUser) {
+            loadUpcoming();
+            loadActiveCount();
+        }
+    }, 5000);
 }
 
 // ── Mark Done / Mark Lost modals ──────────────────────────
@@ -1106,14 +1132,6 @@ function updateCountdowns() {
         const label = countdownLabel(deadline);
         cell.textContent = label || '—';
     });
-}
-
-function startCountdown() {
-    if (countdownInterval) clearInterval(countdownInterval);
-    countdownInterval = setInterval(() => {
-        updateCountdowns();
-        applyDuePenalties();
-    }, 5000);
 }
 
 async function openAllTodos() {

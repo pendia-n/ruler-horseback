@@ -136,16 +136,30 @@ pub fn validate_resolution(description: &str) -> Result<(), String> {
 
 pub fn count_active_todos(user_id: &str) -> Result<i32, String> {
     let conn = get_conn()?;
-    let count: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM todos
+    // Get all candidate todos and filter in Rust for reliability
+    let mut stmt = conn.prepare(
+        "SELECT id, deadline FROM todos
          WHERE user_id = ?1
            AND completed = 0
-           AND lost = 0
-           AND due_processed = 0
-           AND deadline > datetime('now')",
-        params![user_id],
-        |row| row.get(0),
-    ).map_err(|e| format!("Failed to count active todos: {}", e))?;
+           AND lost = 0"
+    ).map_err(|e| format!("Failed to query active todos: {}", e))?;
+
+    let now = chrono::Local::now().naive_local();
+    let rows: Vec<(u32, String)> = stmt
+        .query_map(params![user_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("Failed to query active todos: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Only count todos with future deadlines (not due)
+    let count = rows.iter().filter(|(_, deadline_str)| {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(deadline_str, "%Y-%m-%d %H:%M:%S") {
+            dt > now
+        } else {
+            false
+        }
+    }).count() as i32;
+
     Ok(count)
 }
 

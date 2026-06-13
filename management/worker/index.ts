@@ -251,63 +251,44 @@ app.post('/api/credits/apply-stats', authMiddleware, async (c) => {
   const due = Math.max(0, due_count || 0)
 
   // Calculate delta: +5 per 10 done, -10 per 5 lost, -12 per due
+  // Simple approach: apply delta directly without cumulative tracking
   const rewardFromDone = Math.floor(done / 10) * 5
   const penaltyFromLost = Math.floor(lost / 5) * 10
   const penaltyFromDue = due * 12
   const netDelta = rewardFromDone - penaltyFromLost - penaltyFromDue
 
-  // Get or create user_stats row
-  let stats = await c.env.DB.prepare(
-    'SELECT total_done, total_lost, total_due, net_credit_delta FROM user_stats WHERE user_id = ?'
-  ).bind(userId).first() as any
-
-  if (!stats) {
-    await c.env.DB.prepare(
-      'INSERT INTO user_stats (user_id, total_done, total_lost, total_due, net_credit_delta) VALUES (?, 0, 0, 0, 0)'
-    ).bind(userId).run()
-    stats = { total_done: 0, total_lost: 0, total_due: 0, net_credit_delta: 0 }
-  }
-
-  // Calculate what the new totals should be
-  const newTotalDone = (stats.total_done || 0) + done
-  const newTotalLost = (stats.total_lost || 0) + lost
-  const newTotalDue = (stats.total_due || 0) + due
-
-  // Calculate what the net delta SHOULD be at these totals
-  const expectedNetDelta = Math.floor(newTotalDone / 10) * 5
-    - Math.floor(newTotalLost / 5) * 10
-    - newTotalDue * 12
-
-  // The actual delta to apply is the difference
-  const actualDelta = expectedNetDelta - (stats.net_credit_delta || 0)
-
-  // Apply to user credits — always apply the full delta (can go negative for penalties)
-  if (actualDelta != 0) {
+  // Update user credits — always apply (can go negative)
+  if (netDelta != 0) {
     const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
     const currentCredits = user?.credits || 0
-    const newCredits = currentCredits + actualDelta
+    const newCredits = currentCredits + netDelta
     await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
   }
 
-  // Update stats
+  // Update stats for tracking
   await c.env.DB.prepare(
     'INSERT OR REPLACE INTO user_stats (user_id, total_done, total_lost, total_due, net_credit_delta) VALUES (?, ?, ?, ?, ?)'
-  ).bind(userId, newTotalDone, newTotalLost, newTotalDue, expectedNetDelta).run()
+  ).bind(userId,
+    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_done), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + done,
+    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_lost), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + lost,
+    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_due), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + due,
+    netDelta
+  ).run()
 
   const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
 
   return c.json({
-    applied: actualDelta,
+    applied: netDelta,
     credits: user?.credits || 0,
     stats: {
-      total_done: newTotalDone,
-      total_lost: newTotalLost,
-      total_due: newTotalDue,
+      total_done: done,
+      total_lost: lost,
+      total_due: due,
     },
     breakdown: {
-      reward_from_done: Math.floor(newTotalDone / 10) * 5,
-      penalty_from_lost: Math.floor(newTotalLost / 5) * 10,
-      penalty_from_due: newTotalDue * 12,
+      reward_from_done: rewardFromDone,
+      penalty_from_lost: penaltyFromLost,
+      penalty_from_due: penaltyFromDue,
     }
   })
 })
