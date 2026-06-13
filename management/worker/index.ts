@@ -250,11 +250,10 @@ app.post('/api/credits/apply-stats', authMiddleware, async (c) => {
   const lost = Math.max(0, lost_count || 0)
   const due = Math.max(0, due_count || 0)
 
-  // Calculate delta: +5 per 10 done, -10 per 5 lost, -12 per due
-  // Simple approach: apply delta directly without cumulative tracking
+  // Calculate delta: +5 per 10 done, -10 per 5 lost, -3 per due
   const rewardFromDone = Math.floor(done / 10) * 5
   const penaltyFromLost = Math.floor(lost / 5) * 10
-  const penaltyFromDue = due * 12
+  const penaltyFromDue = due * 3
   const netDelta = rewardFromDone - penaltyFromLost - penaltyFromDue
 
   // Update user credits — always apply (can go negative)
@@ -265,31 +264,13 @@ app.post('/api/credits/apply-stats', authMiddleware, async (c) => {
     await c.env.DB.prepare('UPDATE users SET credits = ? WHERE id = ?').bind(newCredits, userId).run()
   }
 
-  // Update stats for tracking
-  await c.env.DB.prepare(
-    'INSERT OR REPLACE INTO user_stats (user_id, total_done, total_lost, total_due, net_credit_delta) VALUES (?, ?, ?, ?, ?)'
-  ).bind(userId,
-    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_done), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + done,
-    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_lost), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + lost,
-    (await c.env.DB.prepare('SELECT COALESCE(SUM(total_due), 0) as val FROM user_stats WHERE user_id = ?').bind(userId).first() as any)?.val || 0 + due,
-    netDelta
-  ).run()
-
   const user = await c.env.DB.prepare('SELECT credits FROM users WHERE id = ?').bind(userId).first() as any
 
   return c.json({
     applied: netDelta,
     credits: user?.credits || 0,
-    stats: {
-      total_done: done,
-      total_lost: lost,
-      total_due: due,
-    },
-    breakdown: {
-      reward_from_done: rewardFromDone,
-      penalty_from_lost: penaltyFromLost,
-      penalty_from_due: penaltyFromDue,
-    }
+    stats: { total_done: done, total_lost: lost, total_due: due },
+    breakdown: { reward_from_done: rewardFromDone, penalty_from_lost: penaltyFromLost, penalty_from_due: penaltyFromDue }
   })
 })
 

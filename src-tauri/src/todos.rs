@@ -489,27 +489,32 @@ pub fn toggle_completed(id: u32, user_id: String) -> Result<bool, String> {
 #[tauri::command]
 pub fn detect_due_todos(user_id: String) -> Result<DueResult, String> {
     let conn = get_conn()?;
+    // Get all non-completed, non-lost todos and filter by deadline in Rust
+    // (SQLite datetime('now') uses UTC, but deadlines may be stored in local time)
+    let mut stmt = conn.prepare(
+        "SELECT id, deadline FROM todos
+         WHERE user_id = ?1
+           AND completed = 0
+           AND lost = 0
+           AND due_processed = 0"
+    ).map_err(|e| e.to_string())?;
 
-    // Find todos that are past deadline, not completed, not lost, not yet processed
-    // Collect IDs first, then drop the statement before using conn again
-    let due_ids: Vec<u32> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM todos 
-             WHERE user_id = ?1 
-               AND deadline < datetime('now') 
-               AND completed = 0 
-               AND lost = 0 
-               AND due_processed = 0",
-        ).map_err(|e| e.to_string())?;
-        let ids: Vec<u32> = stmt.query_map(params![user_id], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        ids
-    };
+    let now = chrono::Local::now().naive_local();
+    let rows: Vec<(u32, String)> = stmt.query_map(params![user_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    }).map_err(|e| e.to_string())?.filter_map(|r| r.ok()).collect();
+
+    let mut due_ids: Vec<u32> = Vec::new();
+    for (id, deadline_str) in &rows {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(deadline_str, "%Y-%m-%d %H:%M:%S") {
+            if dt <= now {
+                due_ids.push(*id);
+            }
+        }
+    }
 
     let due_count = due_ids.len() as i32;
-    let penalty = due_count * 12; // -12 credits per due todo
+    let penalty = due_count * 3; // -3 credits per due todo
 
     // Mark them as processed
     for id in &due_ids {

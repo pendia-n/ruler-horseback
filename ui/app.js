@@ -104,7 +104,7 @@ function showBanner() {
         banner.classList.add('show');
         setTimeout(() => {
             banner.classList.remove('show');
-        }, 5000);
+        }, 1000);
     }
 }
 
@@ -408,25 +408,16 @@ async function applyDuePenalties() {
     try {
         const result = await invoke('detect_due_todos', { userId: currentUser.id });
         if (result.due_count > 0) {
-            const penalty = result.due_count * 12;
-            // Deduct credits from worker if logged in
+            // Deduct credits via worker (-3 per due todo)
             if (authToken) {
-                const res = await fetch(`${API}/api/credits/apply-stats`, {
+                await fetch(`${API}/api/credits/apply-stats`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
                     body: JSON.stringify({ done_count: 0, lost_count: 0, due_count: result.due_count }),
                 });
-                if (!res.ok) {
-                    console.error('Worker apply-stats failed:', res.status, await res.text());
-                }
                 fetchCredits();
             }
-            // Always show feedback
-            console.log(`Due detection: ${result.due_count} todo(s), -${penalty} credits`);
-            // Update header balance display immediately
-            userCredits = Math.max(0, userCredits - penalty);
-            updateCreditDisplay();
-            // Reload table to remove due todos
+            // Immediately fetch and display only pending todos (no due todos on dashboard)
             loadUpcoming();
             loadActiveCount();
         }
@@ -437,19 +428,22 @@ async function applyDuePenalties() {
 
 function startCountdown() {
     if (countdownInterval) clearInterval(countdownInterval);
-    // Update countdown text every 1.5s — no table re-render
     countdownInterval = setInterval(() => {
         updateCountdowns();
     }, 1500);
-    // Check for due todos and refresh dashboard every 5s
+    // Backend pull: update active count and detect due todos every 5s (no blink)
     setInterval(() => {
-        applyDuePenalties();
-        // Always refresh to catch any changes
+        if (currentUser) {
+            loadActiveCount();
+            applyDuePenalties();
+        }
+    }, 1000);
+    // UI blink: re-render dashboard table every 10s
+    setInterval(() => {
         if (currentUser) {
             loadUpcoming();
-            loadActiveCount();
         }
-    }, 5000);
+    }, 60000);
 }
 
 // ── Mark Done / Mark Lost modals ──────────────────────────
