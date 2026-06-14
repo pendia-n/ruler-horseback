@@ -288,7 +288,6 @@ const AI_FREE_MODELS = [
   'qwen/qwen3-coder:free',
 ]
 const AI_PAID_FALLBACK = 'inclusionai/ling-2.6-flash'
-const AI_TIMEOUT_MS = 10000
 
 function buildAIPrompt(body: any): string {
   return `You are a task completion validator. Rate how trustworthy a user's description is on a scale of 0-12.
@@ -318,7 +317,7 @@ Respond ONLY as JSON: {"score": N, "maxScore": 12, "reason": "brief explanation"
 
 async function callOpenRouter(apiKey: string, model: string, prompt: string): Promise<any> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 25000)
+  const timeout = setTimeout(() => controller.abort(), 4000)
   try {
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
