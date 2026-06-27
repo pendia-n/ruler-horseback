@@ -474,7 +474,7 @@ async function openMarkDoneModal(id) {
                 <div class="form-group">
                     <label>How was this completed? *</label>
                     <textarea id="done-desc-input" rows="3" placeholder="Describe what you did — be specific. What was the outcome? Which files/tasks were involved?">${escHtml(todo.resolution || '')}</textarea>
-                    <p class="hint" id="done-desc-hint">Describe what you did — be specific for a better AI score.</p>
+                    <p class="hint" id="done-desc-hint">Min 12 chars, 3+ words. Specific descriptions get better credit scores.</p>
                 </div>
             </div>
             <div id="done-msg" class="msg"></div>
@@ -504,33 +504,37 @@ async function openMarkDoneModal(id) {
         btn.innerHTML = '<span class="loading-spinner"></span>';
 
         try {
-            // Step 1: Send to worker for AI validation + OpenRouter
-            if (authToken) {
-                const aiRes = await fetch(`${API}/api/ai/validate-description`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-                    body: JSON.stringify({
-                        todoTitle: todo.title,
-                        todoDescription: todo.description || '',
-                        createdDate: todo.created_at || '',
-                        endDate: new Date().toISOString(),
-                        type: 'done',
-                        resolutionDescription: desc,
-                    }),
-                });
-                if (aiRes.ok) {
-                    const aiData = await aiRes.json();
-                    const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
-                    const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
-                    showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
-                }
-            }
-
-            // Step 2: Update local SQLite
+            // Step 1: Rust backend validates description (junk filter)
             await invoke('mark_done', { id, userId: currentUser.id, resolution: desc });
 
-            // Step 3: Batch credit sync
+            // Step 2: AI validation (rate limit: 1/min, +/-1 credit)
             if (authToken) {
+                try {
+                    const aiRes = await fetch(`${API}/api/ai/validate-description`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                        body: JSON.stringify({
+                            todoTitle: todo.title,
+                            todoDescription: todo.description || '',
+                            createdDate: todo.created_at || '',
+                            endDate: new Date().toISOString(),
+                            type: 'done',
+                            resolutionDescription: desc,
+                        }),
+                    });
+                    if (aiRes.ok) {
+                        const aiData = await aiRes.json();
+                        // Show AI feedback briefly
+                        const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
+                        const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
+                        showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
+                    }
+                    // If AI fails (rate limit, service down), continue anyway — not blocking
+                } catch (aiErr) {
+                    console.error('AI validation failed:', aiErr);
+                }
+
+                // Step 3: Batch credit sync (+5 per 10 done, etc.)
                 await fetch(`${API}/api/credits/apply-stats`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
@@ -576,7 +580,7 @@ async function openMarkLostModal(id) {
             <div class="form-group">
                 <label>Why was this lost? *</label>
                 <textarea id="lost-desc-input" rows="3" placeholder="Explain why this todo was abandoned — be specific. What blocked it? Why is it no longer needed?"></textarea>
-                <p class="hint">Explain why this todo was abandoned — be specific.</p>
+                <p class="hint">Min 12 chars, 3+ words. Helps track patterns.</p>
             </div>
             <div id="lost-msg" class="msg"></div>
             <div class="modal-actions">
@@ -605,33 +609,35 @@ async function openMarkLostModal(id) {
         btn.innerHTML = '<span class="loading-spinner"></span>';
 
         try {
-            // Step 1: Send to worker for AI validation + OpenRouter
-            if (authToken) {
-                const aiRes = await fetch(`${API}/api/ai/validate-description`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-                    body: JSON.stringify({
-                        todoTitle: todo.title,
-                        todoDescription: todo.description || '',
-                        createdDate: todo.created_at || '',
-                        endDate: new Date().toISOString(),
-                        type: 'lost',
-                        resolutionDescription: desc,
-                    }),
-                });
-                if (aiRes.ok) {
-                    const aiData = await aiRes.json();
-                    const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
-                    const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
-                    showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
-                }
-            }
-
-            // Step 2: Update local SQLite
+            // Step 1: Rust backend validates description (junk filter)
             await invoke('mark_lost', { id, userId: currentUser.id, reason: desc });
 
-            // Step 3: Batch credit sync
+            // Step 2: AI validation (rate limit: 1/min, +/-1 credit)
             if (authToken) {
+                try {
+                    const aiRes = await fetch(`${API}/api/ai/validate-description`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                        body: JSON.stringify({
+                            todoTitle: todo.title,
+                            todoDescription: todo.description || '',
+                            createdDate: todo.created_at || '',
+                            endDate: new Date().toISOString(),
+                            type: 'lost',
+                            resolutionDescription: desc,
+                        }),
+                    });
+                    if (aiRes.ok) {
+                        const aiData = await aiRes.json();
+                        const creditText = aiData.credit_change > 0 ? `+${aiData.credit_change} credit` : `${aiData.credit_change} credit`;
+                        const scoreColor = aiData.passed ? '#16a34a' : '#dc2626';
+                        showMsgHtml(msgEl, `AI score: <strong style="color:${scoreColor}">${aiData.score}/${aiData.maxScore}</strong> (${creditText})`, aiData.passed ? 'success' : 'error');
+                    }
+                } catch (aiErr) {
+                    console.error('AI validation failed:', aiErr);
+                }
+
+                // Step 3: Batch credit sync (-10 per 5 lost, etc.)
                 await fetch(`${API}/api/credits/apply-stats`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },

@@ -59,10 +59,84 @@ pub struct DueResult {
 
 const MAX_ACTIVE_TODOS: i32 = 35;
 
+// ── Junk validation ───────────────────────────────────────
+
+/// Validate that a done/lost description is not junk.
+/// Returns Ok(()) if valid, Err(reason) if junk.
+pub fn validate_resolution(description: &str) -> Result<(), String> {
+    let trimmed = description.trim();
+
+    // 1. Minimum length
+    if trimmed.len() < 12 {
+        return Err("Description too short — please write at least 12 characters.".into());
+    }
+
+    // 2. Minimum word count
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() < 3 {
+        return Err("Please write at least 3 words describing what happened.".into());
+    }
+
+    // 3. Single throwaway word check (only if it's 1-2 words total)
+    let throwaways = [
+        "done", "finished", "complete", "completed", "yeah", "yep", "ok", "okay",
+        "sure", "nice", "great", "idk", "na", "n/a", "whatever", "idc", "yup",
+        "done done", "finished it",
+    ];
+    let lower = trimmed.to_lowercase();
+    for t in &throwaways {
+        if lower == *t {
+            return Err(format!("\"{}\" is not a description. Please explain what actually happened.", t));
+        }
+    }
+
+    // 4. All same character repeated
+    let first_char = trimmed.chars().next().unwrap();
+    if trimmed.chars().all(|c| c == first_char) {
+        return Err("That doesn't look like a real description.".into());
+    }
+
+    // 5. Character variety: reject if >70% same character
+    let mut char_counts = [0u32; 256];
+    for c in trimmed.chars() {
+        char_counts[c as usize % 256] += 1;
+    }
+    let max_count = *char_counts.iter().max().unwrap() as f64;
+    if max_count / trimmed.len() as f64 > 0.70 {
+        return Err("That looks like random characters. Please write a real description.".into());
+    }
+
+    // 6. Consonant ratio check (gibberish detection)
+    let vowels = "aeiouAEIOU";
+    let letter_count = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    if letter_count >= 5 {
+        let consonant_count = trimmed.chars()
+            .filter(|c| c.is_alphabetic() && !vowels.contains(*c))
+            .count();
+        let ratio = consonant_count as f64 / letter_count as f64;
+        if ratio > 0.85 {
+            return Err("That looks like gibberish. Please write a real description.".into());
+        }
+    }
+
+    // 7. Keyboard mash: no spaces and not a real word
+    if !trimmed.contains(' ') {
+        // Single "word" — check if it looks like keyboard mash
+        // Real single words that are valid: allow them if they're in a small whitelist
+        let valid_single_words = ["submitted", "completed", "finished", "resolved", "shipped", "deployed", "merged", "fixed", "closed", "handled"];
+        if !valid_single_words.contains(&trimmed.to_lowercase().as_str()) {
+            return Err("Please write a full sentence, not just a single word.".into());
+        }
+    }
+
+    Ok(())
+}
+
 // ── Active todo cap ───────────────────────────────────────
 
 pub fn count_active_todos(user_id: &str) -> Result<i32, String> {
     let conn = get_conn()?;
+    // Get all candidate todos and filter in Rust for reliability
     let mut stmt = conn.prepare(
         "SELECT id, deadline FROM todos
          WHERE user_id = ?1
@@ -77,6 +151,7 @@ pub fn count_active_todos(user_id: &str) -> Result<i32, String> {
         .filter_map(|r| r.ok())
         .collect();
 
+    // Only count todos with future deadlines (not due)
     let count = rows.iter().filter(|(_, deadline_str)| {
         if let Ok(dt) = NaiveDateTime::parse_from_str(deadline_str, "%Y-%m-%d %H:%M:%S") {
             dt > now
@@ -113,6 +188,7 @@ pub fn get_active_count(user_id: String) -> Result<ActiveCount, String> {
 #[tauri::command]
 pub fn get_upcoming_todos(user_id: String) -> Result<Vec<Todo>, String> {
     let conn = get_conn()?;
+    // Get all non-completed, non-lost todos (including past-due), filter in Rust
     let mut stmt = conn.prepare(
         "SELECT id, title, deadline, description, edit_count, completed, lost, category_id, resolution
          FROM todos
@@ -127,7 +203,9 @@ pub fn get_upcoming_todos(user_id: String) -> Result<Vec<Todo>, String> {
         .query_map(params![user_id], |row| {
             let deadline_str: String = row.get(2)?;
             let dt = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S").unwrap_or(now);
+            // Only include if deadline is in the future (not due)
             if dt <= now {
+                // Return a dummy that will be filtered out
                 Ok(Todo {
                     id: 0,
                     title: String::new(),
@@ -242,11 +320,12 @@ pub fn get_todo(id: u32) -> Result<Todo, String> {
 
 #[tauri::command]
 pub fn add_todo(user_id: String, title: String, description: String, deadline: String, category_id: Option<u32>) -> Result<bool, String> {
+    // Enforce active todo cap
     check_active_cap(&user_id)?;
 
     let conn = get_conn()?;
     conn.execute(
-        "INSERT INTO todos (user_id, title, description, deadline, edit_count, category_id)
+        "INSERT INTO todos (user_id, title, description, deadline, edit_count, category_id) 
          VALUES (?1, ?2, ?3, ?4, 0, ?5)",
         params![user_id, title, description, deadline, category_id],
     ).map_err(|e: rusqlite::Error| e.to_string())?;
@@ -258,7 +337,7 @@ pub fn update_todo(id: u32, title: String, description: String, deadline: String
     let conn = get_conn()?;
 
     let current: (String, String, u32, i32, i32, Option<u32>) = conn.query_row(
-        "SELECT title, deadline, edit_count, completed, lost, category_id
+        "SELECT title, deadline, edit_count, completed, lost, category_id 
          FROM todos WHERE id = ?1 AND user_id = ?2",
         params![id, user_id],
         |row| Ok((
@@ -273,6 +352,7 @@ pub fn update_todo(id: u32, title: String, description: String, deadline: String
 
     let (current_title, current_deadline, edit_count, completed, lost, current_category_id) = current;
 
+    // Can't edit completed or lost todos
     if completed != 0 {
         return Err("Cannot edit a completed todo.".into());
     }
@@ -298,7 +378,7 @@ pub fn update_todo(id: u32, title: String, description: String, deadline: String
     let new_edit_count = edit_count + 1;
 
     conn.execute(
-        "UPDATE todos SET title = ?1, description = ?2, deadline = ?3, edit_count = ?4,
+        "UPDATE todos SET title = ?1, description = ?2, deadline = ?3, edit_count = ?4, 
          category_id = ?5, updated_at = datetime('now') WHERE id = ?6",
         params![title, description, deadline, new_edit_count, category_id, id],
     ).map_err(|e: rusqlite::Error| e.to_string())?;
@@ -308,8 +388,12 @@ pub fn update_todo(id: u32, title: String, description: String, deadline: String
 
 #[tauri::command]
 pub fn mark_done(id: u32, user_id: String, resolution: String) -> Result<bool, String> {
+    // Validate description
+    validate_resolution(&resolution)?;
+
     let conn = get_conn()?;
 
+    // Verify ownership and check state
     let (completed, lost, deadline_str): (i32, i32, String) = conn.query_row(
         "SELECT completed, lost, deadline FROM todos WHERE id = ?1 AND user_id = ?2",
         params![id, user_id],
@@ -323,6 +407,7 @@ pub fn mark_done(id: u32, user_id: String, resolution: String) -> Result<bool, S
         return Err("Todo is already marked as lost.".into());
     }
 
+    // Can only mark done BEFORE deadline
     let deadline = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S")
         .map_err(|e| format!("Invalid deadline format: {}", e))?;
     let now = chrono::Local::now().naive_local();
@@ -340,8 +425,12 @@ pub fn mark_done(id: u32, user_id: String, resolution: String) -> Result<bool, S
 
 #[tauri::command]
 pub fn mark_lost(id: u32, user_id: String, reason: String) -> Result<bool, String> {
+    // Validate description
+    validate_resolution(&reason)?;
+
     let conn = get_conn()?;
 
+    // Verify ownership and check state
     let (completed, lost, deadline_str): (i32, i32, String) = conn.query_row(
         "SELECT completed, lost, deadline FROM todos WHERE id = ?1 AND user_id = ?2",
         params![id, user_id],
@@ -355,6 +444,7 @@ pub fn mark_lost(id: u32, user_id: String, reason: String) -> Result<bool, Strin
         return Err("Todo is already marked as lost.".into());
     }
 
+    // Can only mark lost BEFORE deadline
     let deadline = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S")
         .map_err(|e| format!("Invalid deadline format: {}", e))?;
     let now = chrono::Local::now().naive_local();
@@ -399,6 +489,8 @@ pub fn toggle_completed(id: u32, user_id: String) -> Result<bool, String> {
 #[tauri::command]
 pub fn detect_due_todos(user_id: String) -> Result<DueResult, String> {
     let conn = get_conn()?;
+    // Get all non-completed, non-lost todos and filter by deadline in Rust
+    // (SQLite datetime('now') uses UTC, but deadlines may be stored in local time)
     let mut stmt = conn.prepare(
         "SELECT id, deadline FROM todos
          WHERE user_id = ?1
@@ -422,8 +514,9 @@ pub fn detect_due_todos(user_id: String) -> Result<DueResult, String> {
     }
 
     let due_count = due_ids.len() as i32;
-    let penalty = due_count * 3;
+    let penalty = due_count * 3; // -3 credits per due todo
 
+    // Mark them as processed
     for id in &due_ids {
         conn.execute(
             "UPDATE todos SET due_processed = 1 WHERE id = ?1",
@@ -484,6 +577,7 @@ pub fn delete_todo(id: u32, user_id: String) -> Result<bool, String> {
         None => return Err("Todo not found".to_string()),
     };
 
+    // Can't delete completed or lost todos
     if completed != 0 {
         return Err("Cannot delete a completed todo.".into());
     }
@@ -491,6 +585,7 @@ pub fn delete_todo(id: u32, user_id: String) -> Result<bool, String> {
         return Err("Cannot delete a lost todo.".into());
     }
 
+    // Can't delete past/overdue todos
     let deadline_dt = NaiveDateTime::parse_from_str(&deadline_str, "%Y-%m-%d %H:%M:%S")
         .map_err(|e| format!("Invalid deadline format: {}", e))?;
     let now = chrono::Local::now().naive_local();
@@ -498,6 +593,7 @@ pub fn delete_todo(id: u32, user_id: String) -> Result<bool, String> {
         return Err("Cannot delete a past/overdue todo".to_string());
     }
 
+    // Log the deletion locally
     let weekly = credits::get_weekly_deletions(&user_id)?;
     let cost = credits::get_delete_cost(weekly);
     credits::log_deletion(&user_id, cost, &todo_title)?;
